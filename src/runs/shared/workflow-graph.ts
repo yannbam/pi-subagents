@@ -26,6 +26,8 @@ function normalizeStatus(status: string | undefined): WorkflowNodeStatus | undef
 			return "paused";
 		case "detached":
 			return "detached";
+		case "rejected":
+			return "rejected";
 		case "pending":
 			return "pending";
 		default:
@@ -62,6 +64,7 @@ function seqLabel(step: SequentialStep, stepIndex: number): string {
 
 function summarizeParallelStatuses(statuses: WorkflowNodeStatus[]): WorkflowNodeStatus {
 	if (statuses.some((status) => status === "running")) return "running";
+	if (statuses.some((status) => status === "rejected")) return "rejected";
 	if (statuses.some((status) => status === "failed")) return "failed";
 	if (statuses.some((status) => status === "paused")) return "paused";
 	if (statuses.some((status) => status === "detached")) return "detached";

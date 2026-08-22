@@ -5,6 +5,8 @@ import {
 	getSubagentDepthEnv,
 	DEFAULT_SUBAGENT_MAX_DEPTH,
 	normalizeMaxSubagentDepth,
+	normalizeMaxSubagentSpawnsPerSession,
+	resolveMaxSubagentSpawnsPerSession,
 	resolveTopLevelParallelConcurrency,
 	resolveTopLevelParallelMaxTasks,
 	resolveChildMaxSubagentDepth,
@@ -13,10 +15,12 @@ import {
 
 let savedDepth: string | undefined;
 let savedMaxDepth: string | undefined;
+let savedMaxSpawns: string | undefined;
 
 beforeEach(() => {
 	savedDepth = process.env.PI_SUBAGENT_DEPTH;
 	savedMaxDepth = process.env.PI_SUBAGENT_MAX_DEPTH;
+	savedMaxSpawns = process.env.PI_SUBAGENT_MAX_SPAWNS_PER_SESSION;
 });
 
 afterEach(() => {
@@ -24,6 +28,8 @@ afterEach(() => {
 	else process.env.PI_SUBAGENT_DEPTH = savedDepth;
 	if (savedMaxDepth === undefined) delete process.env.PI_SUBAGENT_MAX_DEPTH;
 	else process.env.PI_SUBAGENT_MAX_DEPTH = savedMaxDepth;
+	if (savedMaxSpawns === undefined) delete process.env.PI_SUBAGENT_MAX_SPAWNS_PER_SESSION;
+	else process.env.PI_SUBAGENT_MAX_SPAWNS_PER_SESSION = savedMaxSpawns;
 });
 
 describe("DEFAULT_SUBAGENT_MAX_DEPTH", () => {
@@ -43,6 +49,53 @@ describe("normalizeMaxSubagentDepth", () => {
 		assert.equal(normalizeMaxSubagentDepth(-1), undefined);
 		assert.equal(normalizeMaxSubagentDepth(1.5), undefined);
 		assert.equal(normalizeMaxSubagentDepth("garbage"), undefined);
+	});
+});
+
+describe("normalizeMaxSubagentSpawnsPerSession", () => {
+	it("accepts integers >= 0", () => {
+		assert.equal(normalizeMaxSubagentSpawnsPerSession(0), 0);
+		assert.equal(normalizeMaxSubagentSpawnsPerSession(12), 12);
+		assert.equal(normalizeMaxSubagentSpawnsPerSession("9"), 9);
+	});
+
+	it("rejects negatives and non-integers", () => {
+		assert.equal(normalizeMaxSubagentSpawnsPerSession(-1), undefined);
+		assert.equal(normalizeMaxSubagentSpawnsPerSession(1.5), undefined);
+		assert.equal(normalizeMaxSubagentSpawnsPerSession("garbage"), undefined);
+	});
+});
+
+describe("resolveMaxSubagentSpawnsPerSession", () => {
+	it("uses positive env values as opt-in caps", () => {
+		process.env.PI_SUBAGENT_MAX_SPAWNS_PER_SESSION = "5";
+		assert.equal(resolveMaxSubagentSpawnsPerSession(1), 5);
+	});
+
+	it("falls back to a positive config cap when env is absent", () => {
+		delete process.env.PI_SUBAGENT_MAX_SPAWNS_PER_SESSION;
+		assert.equal(resolveMaxSubagentSpawnsPerSession(7), 7);
+	});
+
+	it("ignores invalid env values and falls back to config", () => {
+		for (const value of ["garbage", "-1", "1.5"]) {
+			process.env.PI_SUBAGENT_MAX_SPAWNS_PER_SESSION = value;
+			assert.equal(resolveMaxSubagentSpawnsPerSession(7), 7);
+			assert.equal(resolveMaxSubagentSpawnsPerSession(undefined), undefined);
+		}
+	});
+
+	it("is unlimited by default", () => {
+		delete process.env.PI_SUBAGENT_MAX_SPAWNS_PER_SESSION;
+		assert.equal(resolveMaxSubagentSpawnsPerSession(undefined), undefined);
+		assert.equal(resolveMaxSubagentSpawnsPerSession(-1), undefined);
+	});
+
+	it("treats zero as an explicit unlimited override", () => {
+		process.env.PI_SUBAGENT_MAX_SPAWNS_PER_SESSION = "0";
+		assert.equal(resolveMaxSubagentSpawnsPerSession(7), undefined);
+		delete process.env.PI_SUBAGENT_MAX_SPAWNS_PER_SESSION;
+		assert.equal(resolveMaxSubagentSpawnsPerSession(0), undefined);
 	});
 });
 

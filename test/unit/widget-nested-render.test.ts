@@ -38,14 +38,53 @@ function job(child: NestedRunSummary): AsyncJobState {
 }
 
 describe("nested widget rendering", () => {
-	it("uses aggregate lines when collapsed and full child rows when expanded", () => {
-		const child = nested("nested-reviewer", "root-run", "running", { currentTool: "read" });
+	it("renders a bounded collapsed tree and full child rows when expanded", () => {
+		const child = nested("nested-reviewer", "root-run", "running", { currentTool: "read", model: "gpt-5.6-luna:medium", thinking: "medium" });
 		const collapsed = buildWidgetLines([job(child)], theme as any, 120, false).join("\n");
-		assert.match(collapsed, /↳ \+1 nested run \(1 running\)/);
-		assert.doesNotMatch(collapsed, /nested-reviewer · running/);
+		assert.match(collapsed, /↳ └─ \[\d{2}:\d{2}:\d{2}\] . nested-reviewer · running · gpt-5.6-luna · thinking medium · read/);
+		assert.equal((collapsed.match(/thinking medium/g) ?? []).length, 1);
 
 		const expanded = buildWidgetLines([job(child)], theme as any, 120, true).join("\n");
-		assert.match(expanded, /↳ . nested-reviewer · running · read/);
+		assert.match(expanded, /↳ \[\d{2}:\d{2}:\d{2}\] . nested-reviewer · running · gpt-5.6-luna · thinking medium · read/);
+
+		const epoch = buildWidgetLines([job(nested("epoch", "root-run", "running", { lastUpdate: 0, startedAt: 0 }))], theme as any, 120, false).join("\n");
+		assert.match(epoch, /↳ └─ \[\d{2}:\d{2}:\d{2}\] . epoch · running/);
+	});
+
+	it("shows four direct leaves and one overflow row while retaining completed siblings", () => {
+		const root = nested("parallel-owner", "root-run", "running", {
+			mode: "parallel",
+			steps: ["one", "two", "three", "four", "five"].map((agent, index) => ({
+				agent,
+				status: index === 0 ? "complete" as const : "running" as const,
+				model: index === 0 ? "gpt-5.6-luna:medium" : "gpt-5.6-luna",
+				thinking: "medium",
+			})),
+		});
+		const collapsed = buildWidgetLines([job(root)], theme as any, 160, false).join("\n");
+		assert.match(collapsed, /parallel-owner · running/);
+		for (const [agent, state] of [["one", "complete"], ["two", "running"], ["three", "running"], ["four", "running"]] as const) {
+			const line = collapsed.split("\n").find((candidate) => candidate.includes(` ${agent} ·`));
+			assert.ok(line);
+			assert.match(line!, /\[\d{2}:\d{2}:\d{2}\] /);
+			assert.match(line!, /gpt-5.6-luna/);
+			assert.match(line!, /thinking medium/);
+			assert.match(line!, new RegExp(state));
+		}
+		assert.doesNotMatch(collapsed, /five · running/);
+
+		const chain = nested("chain-owner", "root-run", "running", {
+			mode: "chain",
+			steps: ["first", "second"].map((agent) => ({ agent, status: "running" as const })),
+		});
+		const chainCollapsed = buildWidgetLines([job(chain)], theme as any, 160, false).join("\n");
+		for (const agent of ["first", "second"]) {
+			const line = chainCollapsed.split("\n").find((candidate) => candidate.includes(` ${agent} ·`));
+			assert.ok(line);
+			assert.match(line!, /\[\d{2}:\d{2}:\d{2}\] /);
+		}
+		assert.match(collapsed, /\+1 more nested leaves/);
+		assert.equal((collapsed.match(/thinking medium/g) ?? []).length, 4);
 	});
 
 	it("collapses descendants beyond the nested depth budget", () => {
@@ -71,13 +110,38 @@ describe("nested widget rendering", () => {
 		state.steps![0]!.status = "complete";
 		const expanded = buildWidgetLines([state], theme as any, 120, true).join("\n");
 		assert.match(expanded, /✓ Step 1\/1: owner · complete/);
-		assert.match(expanded, /↳ . still-running · running/);
+		assert.match(expanded, /↳ \[\d{2}:\d{2}:\d{2}\] . still-running · running/);
 	});
 
 	it("degrades stale child summaries to id and state", () => {
 		const child = nested("missing-metadata", "root-run", "failed", { agent: undefined, error: "owner gone" });
 		const expanded = buildWidgetLines([job(child)], theme as any, 120, true).join("\n");
-		assert.match(expanded, /missing-metadata · failed · Failed · owner gone/);
+		assert.match(expanded, /\[\d{2}:\d{2}:\d{2}\] . missing-metadata · failed · Failed · owner gone/);
+	});
+
+	it("timestamps every nested lifecycle state and completed steps", () => {
+		const states: NestedRunSummary["state"][] = ["queued", "running", "complete", "failed", "paused", "stopped"];
+		const root = nested("matrix-root", "root-run", "running", {
+			steps: [{ agent: "completed-step", status: "completed", endedAt: 2_000 }],
+			children: states.map((state, index) => nested(`child-${state}`, "matrix-root", state, {
+				parentStepIndex: undefined,
+				startedAt: 1_000 + index,
+				...(state === "running" ? { lastActivityAt: 2_000 + index } : { endedAt: 2_000 + index }),
+			})),
+		});
+		const expanded = buildWidgetLines([job(root)], theme as any, 200, true).join("\n");
+		for (const state of states) {
+			assert.match(expanded, new RegExp(`\\[\\d{2}:\\d{2}:\\d{2}\\] . child-${state} · ${state}`));
+		}
+		assert.match(expanded, /\[\d{2}:\d{2}:\d{2}\] . completed-step · completed/);
+	});
+
+	it("keeps event-time timestamps stable instead of advancing with wall time", async () => {
+		const state = job(nested("nested-reviewer", "root-run", "running", { currentTool: "read", currentToolStartedAt: 0 }));
+		const first = buildWidgetLines([state], theme as any, 120, true);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		const second = buildWidgetLines([state], theme as any, 120, true);
+		assert.deepEqual(second, first);
 	});
 
 	it("rerenders when only nested state changes", () => {

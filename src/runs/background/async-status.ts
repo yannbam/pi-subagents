@@ -2,21 +2,31 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { formatDuration, formatModelThinking, formatTokens, shortenPath } from "../../shared/formatters.ts";
 import { formatActivityLabel, formatParallelOutcome } from "../../shared/status-format.ts";
-import { type ActivityState, type AsyncJobStep, type AsyncParallelGroupStatus, type AsyncStatus, type NestedRunSummary, type SubagentRunMode, type TokenUsage } from "../../shared/types.ts";
+import { type ActivityState, type AsyncJobStep, type AsyncParallelGroupStatus, type AsyncStatus, type CostSummary, type Details, type LaunchResolvedChildExtensionsV1, type RuntimeAcknowledgedChildExtensionsV1, type NestedRunSummary, type SteeringStatus, type SubagentRunMode, type TokenUsage, type TurnBudgetState, type UsageBudgetState } from "../../shared/types.ts";
+import type { ResolvedSubagentCapabilityCeiling, SubagentCapabilityAudit } from "../shared/capability-ceiling.ts";
 import { readStatus } from "../../shared/utils.ts";
-import { attachRootChildrenToSteps, findNestedRouteForRootId, projectNestedRegistryForRoot } from "../shared/nested-events.ts";
+import { attachRootChildrenToSteps, buildNestedRouteIndex, findNestedRouteForRootId, type NestedRoute, projectNestedEvents } from "../shared/nested-events.ts";
 import { formatNestedRunStatusLines } from "../shared/nested-render.ts";
+import { formatRunFanoutBudget, getRunFanoutBudgetSnapshot, readRunFanoutBudgetDescriptor } from "../shared/run-fanout-budget.ts";
 import { flatToLogicalStepIndex, normalizeParallelGroups } from "./parallel-groups.ts";
+import { contextModeLabel, summarizeContextModes, type ContextMode, type ContextSummary } from "../shared/context-mode.ts";
 import { reconcileAsyncRun, reconcileNestedAsyncDescendants } from "./stale-run-reconciler.ts";
+import { readProcessTerminal, sanitizeProcessTerminal } from "./process-terminal.ts";
+import { ACTIVE_RUN_INDEX_DIR, DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS, activeRunMarkerAgeMs, isActiveAsyncState, readActiveRunIndex, releaseActiveRunIndex, updateActiveRunIndex } from "./active-run-index.ts";
+import { readRecentTerminalRunIndex, TERMINAL_RUN_INDEX_DIR } from "./terminal-run-index.ts";
+import { canScanAsyncRunPrefix } from "./run-id-query.ts";
 
 interface AsyncRunStepSummary {
 	index: number;
 	agent: string;
+	context?: ContextMode;
 	label?: string;
+	description?: string;
 	phase?: string;
 	outputName?: string;
 	structured?: boolean;
 	status: AsyncJobStep["status"];
+	runner?: AsyncJobStep["runner"];
 	activityState?: ActivityState;
 	lastActivityAt?: number;
 	currentTool?: string;
@@ -27,21 +37,42 @@ interface AsyncRunStepSummary {
 	recentOutput?: string[];
 	turnCount?: number;
 	toolCount?: number;
+	steering?: SteeringStatus;
 	durationMs?: number;
 	tokens?: TokenUsage;
+	totalCost?: CostSummary;
 	skills?: string[];
 	model?: string;
 	thinking?: string;
 	attemptedModels?: string[];
+	sessionFile?: string;
+	transcriptPath?: string;
 	error?: string;
+	timedOut?: boolean;
+	stopped?: boolean;
+	turnBudget?: TurnBudgetState;
+	turnBudgetExceeded?: boolean;
+	wrapUpRequested?: boolean;
+	acceptance?: AsyncJobStep["acceptance"];
+	agentContract?: AsyncJobStep["agentContract"];
+	execution?: AsyncJobStep["execution"];
+	review?: AsyncJobStep["review"];
+	effects?: AsyncJobStep["effects"];
+	processTerminal?: AsyncJobStep["processTerminal"];
+	launchResolvedExtensions?: LaunchResolvedChildExtensionsV1;
+	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensionsV1;
+	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
+	capabilityAudit?: SubagentCapabilityAudit;
 	children?: NestedRunSummary[];
 }
 
 export interface AsyncRunSummary {
 	id: string;
 	asyncDir: string;
+	toolCallId?: string;
 	sessionId?: string;
-	state: "queued" | "running" | "complete" | "failed" | "paused";
+	state: "queued" | "running" | "complete" | "failed" | "paused" | "stopped" | "rejected";
+	error?: string;
 	activityState?: ActivityState;
 	lastActivityAt?: number;
 	currentTool?: string;
@@ -49,11 +80,21 @@ export interface AsyncRunSummary {
 	currentPath?: string;
 	turnCount?: number;
 	toolCount?: number;
+	steering?: SteeringStatus;
 	mode: SubagentRunMode;
+	context?: ContextSummary;
 	cwd?: string;
+	sessionRoot?: string;
 	startedAt: number;
 	lastUpdate?: number;
 	endedAt?: number;
+	timeoutMs?: number;
+	deadlineAt?: number;
+	timedOut?: boolean;
+	stopped?: boolean;
+	turnBudget?: TurnBudgetState;
+	turnBudgetExceeded?: boolean;
+	wrapUpRequested?: boolean;
 	currentStep?: number;
 	chainStepCount?: number;
 	pendingAppends?: number;
@@ -62,19 +103,38 @@ export interface AsyncRunSummary {
 	sessionDir?: string;
 	outputFile?: string;
 	totalTokens?: TokenUsage;
+	totalCost?: CostSummary;
+	usageBudget?: UsageBudgetState;
 	sessionFile?: string;
 	nestedChildren?: NestedRunSummary[];
 	nestedWarnings?: string[];
+	processTerminal?: AsyncStatus["processTerminal"];
+	runFanoutBudget?: AsyncStatus["runFanoutBudget"];
+	launchResolvedExtensions?: LaunchResolvedChildExtensionsV1;
+	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensionsV1;
+	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
+	capabilityAudit?: SubagentCapabilityAudit;
+	parentWorkflowRunId?: string;
+	workflowKey?: string;
+	workflow?: Details["workflow"];
 }
 
 interface AsyncRunListOptions {
 	states?: Array<AsyncRunSummary["state"]>;
 	sessionId?: string;
 	limit?: number;
+	/** Limits terminal candidates using the timestamp embedded in index marker names. */
+	entryLimit?: number;
 	resultsDir?: string;
 	kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean;
 	now?: () => number;
 	reconcile?: boolean;
+	runId?: string;
+	/** The caller already holds a canonical run id; never interpret a miss as a prefix. */
+	exactRunId?: boolean;
+	includeNested?: boolean;
+	/** Explicit repair/debug escape hatch. Normal runtime paths must not set this. */
+	repairScan?: boolean;
 }
 
 function getErrorMessage(error: unknown): string {
@@ -100,6 +160,45 @@ function isAsyncRunDir(root: string, entry: string): boolean {
 	}
 }
 
+type TargetedAsyncRunResolution =
+	| { kind: "exact"; id: string }
+	| { kind: "prefix" }
+	| { kind: "reject" };
+
+/**
+ * Resolve an exact targeted run without following a run-directory symlink or
+ * accepting a path whose canonical location escaped the async root.
+ */
+export function resolveTargetedAsyncRun(asyncDirRoot: string, id: string, sessionId?: string): TargetedAsyncRunResolution {
+	if (!id || id === "." || id === ".." || id === ACTIVE_RUN_INDEX_DIR || id === TERMINAL_RUN_INDEX_DIR || path.basename(id) !== id) return { kind: "reject" };
+	const asyncDir = path.join(asyncDirRoot, id);
+	let entryStat: fs.Stats;
+	try {
+		entryStat = fs.lstatSync(asyncDir);
+	} catch (error) {
+		if (isNotFoundError(error)) return canScanAsyncRunPrefix(id) ? { kind: "prefix" } : { kind: "reject" };
+		throw new Error(`Failed to inspect async run path '${asyncDir}': ${getErrorMessage(error)}`, {
+			cause: error instanceof Error ? error : undefined,
+		});
+	}
+	if (!entryStat.isDirectory() || entryStat.isSymbolicLink()) return { kind: "reject" };
+	try {
+		const canonicalRoot = fs.realpathSync(asyncDirRoot);
+		const canonicalDir = fs.realpathSync(asyncDir);
+		if (canonicalDir !== canonicalRoot && !canonicalDir.startsWith(`${canonicalRoot}${path.sep}`)) return { kind: "reject" };
+	} catch (error) {
+		if (isNotFoundError(error)) return { kind: "reject" };
+		throw new Error(`Failed to resolve async run path '${asyncDir}': ${getErrorMessage(error)}`, {
+			cause: error instanceof Error ? error : undefined,
+		});
+	}
+	if (sessionId !== undefined) {
+		const status = readStatus(asyncDir);
+		if (status?.sessionId !== sessionId) return canScanAsyncRunPrefix(id) ? { kind: "prefix" } : { kind: "reject" };
+	}
+	return { kind: "exact", id };
+}
+
 function outputFileMtime(outputFile: string | undefined): number | undefined {
 	if (!outputFile) return undefined;
 	try {
@@ -118,22 +217,31 @@ function deriveAsyncActivityState(asyncDir: string, status: AsyncStatus): { acti
 	const currentStep = typeof status.currentStep === "number" ? status.steps?.[status.currentStep] : undefined;
 	return {
 		activityState: status.activityState,
-		lastActivityAt: status.lastActivityAt ?? outputFileMtime(outputPath) ?? currentStep?.lastActivityAt ?? currentStep?.startedAt ?? status.startedAt,
+		lastActivityAt: status.lastActivityAt
+			?? outputFileMtime(outputPath)
+			?? currentStep?.lastActivityAt
+			?? (status.mode === "workflow" ? undefined : currentStep?.startedAt ?? status.startedAt),
 	};
 }
 
-function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string }, nestedWarnings: string[] = []): AsyncRunSummary {
+function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string }, nestedWarnings: string[] = [], nestedRoute?: NestedRoute): AsyncRunSummary {
 	if (status.sessionId !== undefined && typeof status.sessionId !== "string") {
 		throw new Error(`Invalid async status '${path.join(asyncDir, "status.json")}': sessionId must be a string.`);
 	}
 	const { activityState, lastActivityAt } = deriveAsyncActivityState(asyncDir, status);
+	const processTerminal = readProcessTerminal(asyncDir, { runId: status.runId, runnerProcessInstanceId: status.processTerminal?.runnerProcessInstanceId })
+		?? sanitizeProcessTerminal(status.processTerminal, { runId: status.runId, runnerProcessInstanceId: status.processTerminal?.runnerProcessInstanceId }, path.join(asyncDir, "status.json"));
+	const runFanoutBudgetDescriptor = readRunFanoutBudgetDescriptor(asyncDir);
+	const runFanoutBudget = runFanoutBudgetDescriptor ? getRunFanoutBudgetSnapshot(runFanoutBudgetDescriptor) : status.runFanoutBudget;
 	const steps = status.steps ?? [];
 	const chainStepCount = status.chainStepCount ?? steps.length;
 	const parallelGroups = normalizeParallelGroups(status.parallelGroups, steps.length, chainStepCount);
 	let nestedChildren: NestedRunSummary[] = [];
-	if (nestedWarnings.length === 0) {
+	if (nestedWarnings.length === 0 && nestedRoute) {
 		try {
-			nestedChildren = projectNestedRegistryForRoot(status.runId || path.basename(asyncDir))?.children ?? [];
+			// The route is resolved by the caller via buildNestedRouteIndex, so this
+			// avoids a fresh scan of the nested-events directory per run.
+			nestedChildren = projectNestedEvents(nestedRoute)?.children ?? [];
 		} catch (error) {
 			nestedWarnings.push(`Nested status unavailable: ${getErrorMessage(error)}`);
 		}
@@ -144,11 +252,14 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 		return {
 			index,
 			agent: step.agent,
+			...(step.context ? { context: step.context } : {}),
 			...(step.label ? { label: step.label } : {}),
+			...(step.description ? { description: step.description } : {}),
 			...(step.phase ? { phase: step.phase } : {}),
 			...(step.outputName ? { outputName: step.outputName } : {}),
 			...(step.structured ? { structured: step.structured } : {}),
 			status: step.status,
+			...(step.runner ? { runner: step.runner } : {}),
 			...(stepActivityState ? { activityState: stepActivityState } : {}),
 			...(stepLastActivityAt ? { lastActivityAt: stepLastActivityAt } : {}),
 			...(step.currentTool ? { currentTool: step.currentTool } : {}),
@@ -159,13 +270,33 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 			...(step.recentOutput ? { recentOutput: [...step.recentOutput] } : {}),
 			...(step.turnCount !== undefined ? { turnCount: step.turnCount } : {}),
 			...(step.toolCount !== undefined ? { toolCount: step.toolCount } : {}),
+			...(step.steering ? { steering: step.steering } : {}),
 			...(step.durationMs !== undefined ? { durationMs: step.durationMs } : {}),
 			...(step.tokens ? { tokens: step.tokens } : {}),
+			...(step.totalCost ? { totalCost: step.totalCost } : {}),
 			...(step.skills ? { skills: step.skills } : {}),
 			...(step.model ? { model: step.model } : {}),
 			...(step.thinking ? { thinking: step.thinking } : {}),
 			...(step.attemptedModels ? { attemptedModels: step.attemptedModels } : {}),
+			...(step.sessionFile ? { sessionFile: step.sessionFile } : {}),
+			...(step.transcriptPath ? { transcriptPath: step.transcriptPath } : {}),
 			...(step.error ? { error: step.error } : {}),
+			...(step.timedOut !== undefined ? { timedOut: step.timedOut } : {}),
+			...(step.stopped !== undefined ? { stopped: step.stopped } : {}),
+			...(step.turnBudget ? { turnBudget: step.turnBudget } : {}),
+			...(step.turnBudgetExceeded !== undefined ? { turnBudgetExceeded: step.turnBudgetExceeded } : {}),
+			...(step.wrapUpRequested !== undefined ? { wrapUpRequested: step.wrapUpRequested } : {}),
+			...(step.acceptance ? { acceptance: step.acceptance } : {}),
+			...(step.agentContract ? { agentContract: step.agentContract } : {}),
+			...(step.launchContractDigest ? { launchContractDigest: step.launchContractDigest } : {}),
+			...(step.launchResolvedExtensions ? { launchResolvedExtensions: step.launchResolvedExtensions } : {}),
+			...(step.runtimeAcknowledgedExtensions ? { runtimeAcknowledgedExtensions: step.runtimeAcknowledgedExtensions } : {}),
+			...(step.execution ? { execution: step.execution } : {}),
+			...(step.review ? { review: step.review } : {}),
+			...(step.effects ? { effects: step.effects } : {}),
+			...(step.processTerminal ? { processTerminal: sanitizeProcessTerminal(step.processTerminal, { runId: status.runId, runnerProcessInstanceId: step.processTerminal.runnerProcessInstanceId }, `${path.join(asyncDir, "status.json")} step ${index}`) } : {}),
+			...(step.capabilityCeiling ? { capabilityCeiling: step.capabilityCeiling } : {}),
+			...(step.capabilityAudit ? { capabilityAudit: step.capabilityAudit } : {}),
 			...(step.children?.length ? { children: step.children } : {}),
 		};
 	});
@@ -173,8 +304,10 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 	return {
 		id: status.runId || path.basename(asyncDir),
 		asyncDir,
+		...(status.toolCallId ? { toolCallId: status.toolCallId } : {}),
 		...(status.sessionId ? { sessionId: status.sessionId } : {}),
 		state: status.state,
+		...(status.error ? { error: status.error } : {}),
 		activityState,
 		lastActivityAt,
 		currentTool: status.currentTool,
@@ -182,11 +315,21 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 		currentPath: status.currentPath,
 		turnCount: status.turnCount,
 		toolCount: status.toolCount,
+		steering: status.steering,
 		mode: status.mode,
+		...(summarizeContextModes(summarizedSteps.map((step) => step.context)) ? { context: summarizeContextModes(summarizedSteps.map((step) => step.context)) } : {}),
 		cwd: status.cwd,
+		...(status.sessionRoot ? { sessionRoot: status.sessionRoot } : {}),
 		startedAt: status.startedAt,
 		lastUpdate: status.lastUpdate,
 		endedAt: status.endedAt,
+		...(status.timeoutMs !== undefined ? { timeoutMs: status.timeoutMs } : {}),
+		...(status.deadlineAt !== undefined ? { deadlineAt: status.deadlineAt } : {}),
+		...(status.timedOut !== undefined ? { timedOut: status.timedOut } : {}),
+		...(status.stopped !== undefined ? { stopped: status.stopped } : {}),
+		...(status.turnBudget ? { turnBudget: status.turnBudget } : {}),
+		...(status.turnBudgetExceeded !== undefined ? { turnBudgetExceeded: status.turnBudgetExceeded } : {}),
+		...(status.wrapUpRequested !== undefined ? { wrapUpRequested: status.wrapUpRequested } : {}),
 		currentStep: status.currentStep,
 		...(status.chainStepCount !== undefined ? { chainStepCount: status.chainStepCount } : {}),
 		...(status.pendingAppends !== undefined ? { pendingAppends: status.pendingAppends } : {}),
@@ -194,11 +337,27 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 		steps: summarizedSteps,
 		...(nestedChildren.length ? { nestedChildren } : {}),
 		...(nestedWarnings.length ? { nestedWarnings } : {}),
+		...(processTerminal ? { processTerminal } : {}),
+		...(runFanoutBudget ? { runFanoutBudget } : {}),
+		...(status.launchContractDigest ? { launchContractDigest: status.launchContractDigest } : {}),
+		...(status.launchResolvedExtensions ? { launchResolvedExtensions: status.launchResolvedExtensions } : {}),
+		...(status.runtimeAcknowledgedExtensions ? { runtimeAcknowledgedExtensions: status.runtimeAcknowledgedExtensions } : {}),
+		...(status.capabilityCeiling ? { capabilityCeiling: status.capabilityCeiling } : {}),
+		...(status.capabilityAudit ? { capabilityAudit: status.capabilityAudit } : {}),
+		...(status.parentWorkflowRunId ? { parentWorkflowRunId: status.parentWorkflowRunId } : {}),
+		...(status.workflowKey ? { workflowKey: status.workflowKey } : {}),
+		...(status.workflow ? { workflow: status.workflow } : {}),
 		...(status.sessionDir ? { sessionDir: status.sessionDir } : {}),
 		...(status.outputFile ? { outputFile: status.outputFile } : {}),
 		...(status.totalTokens ? { totalTokens: status.totalTokens } : {}),
+		...(status.totalCost ? { totalCost: status.totalCost } : {}),
+		...(status.usageBudget ? { usageBudget: status.usageBudget } : {}),
 		...(status.sessionFile ? { sessionFile: status.sessionFile } : {}),
 	};
+}
+
+export function summarizeAsyncStatus(asyncDir: string, status: AsyncStatus & { cwd?: string }): AsyncRunSummary {
+	return statusToSummary(asyncDir, status);
 }
 
 function sortRuns(runs: AsyncRunSummary[]): AsyncRunSummary[] {
@@ -207,8 +366,10 @@ function sortRuns(runs: AsyncRunSummary[]): AsyncRunSummary[] {
 			case "running": return 0;
 			case "queued": return 1;
 			case "failed": return 2;
+			case "stopped": return 2;
 			case "paused": return 2;
 			case "complete": return 3;
+			default: return 4;
 		}
 	};
 	return [...runs].sort((a, b) => {
@@ -222,8 +383,40 @@ function sortRuns(runs: AsyncRunSummary[]): AsyncRunSummary[] {
 
 export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions = {}): AsyncRunSummary[] {
 	let entries: string[];
+	const activeEntries = new Set<string>();
+	const wantsActive = options.states === undefined || options.states.some(isActiveAsyncState);
+	const wantsTerminal = options.states === undefined || options.states.some((state) => !isActiveAsyncState(state));
+	const includeNested = options.includeNested !== false;
 	try {
-		entries = fs.readdirSync(asyncDirRoot).filter((entry) => isAsyncRunDir(asyncDirRoot, entry));
+		if (options.runId !== undefined) {
+			const resolution = resolveTargetedAsyncRun(asyncDirRoot, options.runId, options.sessionId);
+			entries = resolution.kind === "exact"
+				? [resolution.id]
+				: resolution.kind === "prefix" && options.exactRunId !== true
+					? fs.readdirSync(asyncDirRoot).filter((entry) =>
+						(entry === options.runId || entry.startsWith(options.runId!))
+						&& resolveTargetedAsyncRun(asyncDirRoot, entry, options.sessionId).kind === "exact"
+					)
+					: [];
+		} else if (options.repairScan === true) {
+			entries = fs.readdirSync(asyncDirRoot).filter((entry) => entry !== ACTIVE_RUN_INDEX_DIR && entry !== TERMINAL_RUN_INDEX_DIR && isAsyncRunDir(asyncDirRoot, entry));
+		} else {
+			const indexed = new Set<string>();
+			if (wantsActive) {
+				for (const entry of readActiveRunIndex(asyncDirRoot) ?? []) {
+					if (resolveTargetedAsyncRun(asyncDirRoot, entry).kind === "exact") {
+						indexed.add(entry);
+						activeEntries.add(entry);
+					} else {
+						updateActiveRunIndex(path.join(asyncDirRoot, entry), "failed");
+					}
+				}
+			}
+			if (wantsTerminal) {
+				for (const entry of readRecentTerminalRunIndex(asyncDirRoot, { sessionId: options.sessionId, ...(options.entryLimit !== undefined ? { limit: options.entryLimit } : {}) })) indexed.add(entry);
+			}
+			entries = [...indexed];
+		}
 	} catch (error) {
 		if (isNotFoundError(error)) return [];
 		throw new Error(`Failed to list async runs in '${asyncDirRoot}': ${getErrorMessage(error)}`, {
@@ -233,23 +426,50 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 
 	const allowedStates = options.states ? new Set(options.states) : undefined;
 	const runs: AsyncRunSummary[] = [];
+	// Route resolution for every run shares a single index built from the
+	// nested-events directory, so the per-run lookup is O(1) instead of scanning
+	// the directory once per run. The index is built lazily on first use, so
+	// load-time restoration (which only wants queued/running runs) skips it
+	// entirely when no active runs match.
+	let nestedRouteIndex: Map<string, NestedRoute> | undefined;
+	const resolveNestedRoute = (rootRunId: string): NestedRoute | undefined => {
+		if (!includeNested) return undefined;
+		if (activeEntries.has(rootRunId)) return findNestedRouteForRootId(rootRunId);
+		if (!nestedRouteIndex) nestedRouteIndex = buildNestedRouteIndex();
+		return nestedRouteIndex.get(rootRunId);
+	};
 	for (const entry of entries) {
 		const asyncDir = path.join(asyncDirRoot, entry);
 		const reconciliation = options.reconcile === false
 			? undefined
 			: reconcileAsyncRun(asyncDir, { resultsDir: options.resultsDir, kill: options.kill, now: options.now });
 		const status = (reconciliation?.status ?? readStatus(asyncDir)) as (AsyncStatus & { cwd?: string }) | null;
-		if (!status) continue;
-		const nestedWarnings: string[] = [];
-		try {
-			const nestedRoute = findNestedRouteForRootId(status.runId || path.basename(asyncDir));
-			if (nestedRoute) reconcileNestedAsyncDescendants(nestedRoute, { resultsDir: options.resultsDir, kill: options.kill, now: options.now });
-		} catch (error) {
-			nestedWarnings.push(`Nested status unavailable: ${getErrorMessage(error)}`);
+		if (!status) {
+			if (activeEntries.has(entry)) updateActiveRunIndex(asyncDir, "failed");
+			continue;
 		}
-		const summary = statusToSummary(asyncDir, status, nestedWarnings);
-		if (allowedStates && !allowedStates.has(summary.state)) continue;
-		if (options.sessionId && summary.sessionId !== options.sessionId) continue;
+		if (activeEntries.has(entry) && !isActiveAsyncState(status.state)) {
+			const processTerminal = readProcessTerminal(asyncDir, { runId: status.runId, runnerProcessInstanceId: status.processTerminal?.runnerProcessInstanceId });
+			if (processTerminal?.state === "observed" || (activeRunMarkerAgeMs(asyncDir, options.now?.()) ?? 0) > DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS) releaseActiveRunIndex(asyncDir);
+		}
+		if (status.displayDismissedAt !== undefined) continue;
+		// Filter before the nested-route lookup: the lookup builds an index over
+		// the nested-events directory, so deferring it for filtered-out runs keeps
+		// restoration at load from scanning that directory when no active runs
+		// match.
+		if (allowedStates && !allowedStates.has(status.state)) continue;
+		if (options.sessionId && status.sessionId !== options.sessionId) continue;
+		const nestedWarnings: string[] = [];
+		let nestedRoute: NestedRoute | undefined;
+		if (options.reconcile !== false && includeNested) {
+			try {
+				nestedRoute = resolveNestedRoute(status.runId || path.basename(asyncDir));
+				if (nestedRoute) reconcileNestedAsyncDescendants(nestedRoute, { resultsDir: options.resultsDir, kill: options.kill, now: options.now });
+			} catch (error) {
+				nestedWarnings.push(`Nested status unavailable: ${getErrorMessage(error)}`);
+			}
+		}
+		const summary = statusToSummary(asyncDir, status, nestedWarnings, nestedRoute);
 		runs.push(summary);
 	}
 
@@ -257,21 +477,27 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 	return options.limit !== undefined ? sorted.slice(0, options.limit) : sorted;
 }
 
-function formatActivityFacts(input: { activityState?: ActivityState; lastActivityAt?: number; currentTool?: string; currentToolStartedAt?: number; currentPath?: string; turnCount?: number; toolCount?: number }): string | undefined {
+function formatActivityFacts(input: { activityState?: ActivityState; lastActivityAt?: number; currentTool?: string; currentToolStartedAt?: number; currentPath?: string; turnCount?: number; toolCount?: number; steering?: SteeringStatus; turnBudget?: TurnBudgetState; turnBudgetExceeded?: boolean; wrapUpRequested?: boolean }): string | undefined {
 	const facts: string[] = [];
 	if (input.currentTool && input.currentToolStartedAt !== undefined) facts.push(`tool ${input.currentTool} ${formatDuration(Math.max(0, Date.now() - input.currentToolStartedAt))}`);
 	else if (input.currentTool) facts.push(`tool ${input.currentTool}`);
 	if (input.currentPath) facts.push(shortenPath(input.currentPath));
 	if (input.turnCount !== undefined) facts.push(`${input.turnCount} turns`);
+	if (input.turnBudgetExceeded && input.turnBudget) facts.push(`turn budget exceeded ${input.turnBudget.turnCount}/${input.turnBudget.maxTurns}+${input.turnBudget.graceTurns}`);
+	else if (input.turnBudget?.outcome === "termination-deferred") facts.push(`turn-budget termination deferred ${input.turnBudget.turnCount}/${input.turnBudget.maxTurns}+${input.turnBudget.graceTurns}`);
+	else if (input.wrapUpRequested && input.turnBudget) facts.push(`wrap-up requested ${input.turnBudget.turnCount}/${input.turnBudget.maxTurns}`);
+	else if (input.turnBudget) facts.push(`turn budget ${input.turnBudget.turnCount}/${input.turnBudget.maxTurns}+${input.turnBudget.graceTurns}`);
 	if (input.toolCount !== undefined) facts.push(`${input.toolCount} tools`);
+	if (input.steering) facts.push(`steering ${input.steering.scheduled} scheduled, ${input.steering.pending} pending, ${input.steering.delivered} delivered, ${input.steering.failed} failed, ${input.steering.recovered} recovered`);
 	const activity = formatActivityLabel(input.lastActivityAt, input.activityState);
 	return activity || facts.length ? [activity, ...facts].filter(Boolean).join(" | ") : undefined;
 }
 
 function formatStepLine(step: AsyncRunStepSummary): string {
 	const display = step.label ? `${step.label} (${step.agent})` : step.agent;
+	const context = contextModeLabel(step.context);
 	const phase = step.phase ? `[${step.phase}] ` : "";
-	const parts = [`${step.index + 1}. ${phase}${display}`, step.status];
+	const parts = [`${step.index + 1}. ${phase}${display}${context ? ` ${context}` : ""}`, step.status];
 	const activity = formatActivityFacts(step);
 	if (activity) parts.push(activity);
 	const modelThinking = formatModelThinking(step.model, step.thinking);
@@ -312,7 +538,8 @@ function formatRunHeader(run: AsyncRunSummary): string {
 	const cwd = run.cwd ? shortenPath(run.cwd) : shortenPath(run.asyncDir);
 	const activity = formatActivityFacts(run);
 	const pending = run.pendingAppends ? ` | ${run.pendingAppends} pending append${run.pendingAppends === 1 ? "" : "s"}` : "";
-	return `${run.id} | ${run.state}${activity ? ` | ${activity}` : ""} | ${run.mode} | ${stepLabel}${pending} | ${cwd}`;
+	const context = contextModeLabel(run.context);
+	return `${run.id} | ${run.state}${activity ? ` | ${activity}` : ""} | ${run.mode}${context ? ` ${context}` : ""} | ${stepLabel}${pending} | ${cwd}`;
 }
 
 export function formatAsyncRunList(runs: AsyncRunSummary[], heading = "Active async runs"): string {
@@ -328,6 +555,8 @@ export function formatAsyncRunList(runs: AsyncRunSummary[], heading = "Active as
 		const attached = new Set(run.steps.flatMap((step) => step.children?.map((child) => child.id) ?? []));
 		const unattached = run.nestedChildren?.filter((child) => !attached.has(child.id)) ?? [];
 		lines.push(...formatNestedRunStatusLines(unattached, { indent: "  ", maxLines: 12 }));
+		if (run.runFanoutBudget) lines.push(`  ${formatRunFanoutBudget(run.runFanoutBudget)}`);
+		if (run.error) lines.push(`  Error: ${run.error}`);
 		for (const warning of run.nestedWarnings ?? []) lines.push(`  Warning: ${warning}`);
 		const outputPath = formatAsyncRunOutputPath(run);
 		if (outputPath) lines.push(`  output: ${shortenPath(outputPath)}`);

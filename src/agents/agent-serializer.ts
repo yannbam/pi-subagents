@@ -1,3 +1,4 @@
+import { stringify as stringifyYaml } from "yaml";
 import type { AgentConfig } from "./agents.ts";
 import { frontmatterNameForConfig } from "./identity.ts";
 
@@ -5,6 +6,8 @@ export const KNOWN_FIELDS = new Set([
 	"name",
 	"package",
 	"description",
+	"alias",
+	"aliases",
 	"tools",
 	"model",
 	"fallbackModels",
@@ -13,16 +16,29 @@ export const KNOWN_FIELDS = new Set([
 	"inheritProjectContext",
 	"inheritSkills",
 	"defaultContext",
+	"async",
+	"timeoutMs",
+	"toolTimeoutMs",
+	"turnBudget",
+	"acceptance",
+	"acceptanceRole",
 	"skill",
 	"skills",
+	"skillPath",
 	"extensions",
 	"subagentOnlyExtensions",
 	"output",
+	"outputMode",
 	"defaultReads",
 	"defaultProgress",
 	"interactive",
 	"maxSubagentDepth",
 	"completionGuard",
+	"toolBudget",
+	"permission",
+	"permissions",
+	"memory",
+	"runner",
 ]);
 
 function joinComma(values: string[] | undefined): string | undefined {
@@ -42,6 +58,8 @@ export function serializeAgent(config: AgentConfig, options: SerializeAgentOptio
 	lines.push(`name: ${frontmatterNameForConfig(config)}`);
 	if (config.packageName) lines.push(`package: ${config.packageName}`);
 	lines.push(`description: ${config.description}`);
+	const aliasesValue = joinComma(config.aliases);
+	if (aliasesValue || preserve("alias", "aliases")) lines.push(`aliases: ${aliasesValue ?? ""}`);
 
 	const tools = [
 		...(config.tools ?? []),
@@ -60,9 +78,31 @@ export function serializeAgent(config: AgentConfig, options: SerializeAgentOptio
 	if (!preservingExistingFrontmatter || preserve("inheritProjectContext")) lines.push(`inheritProjectContext: ${config.inheritProjectContext ? "true" : "false"}`);
 	if (!preservingExistingFrontmatter || preserve("inheritSkills")) lines.push(`inheritSkills: ${config.inheritSkills ? "true" : "false"}`);
 	if (config.defaultContext || preserve("defaultContext")) lines.push(`defaultContext: ${config.defaultContext ?? ""}`);
+	if (config.runner || preserve("runner")) {
+		if (config.runner) {
+			lines.push("runner:");
+			for (const line of stringifyYaml(config.runner).trimEnd().split("\n")) lines.push(`  ${line}`);
+		} else {
+			lines.push("runner:");
+		}
+	}
+	if (config.defaultAsync !== undefined || preserve("async")) lines.push(`async: ${config.defaultAsync === undefined ? "" : config.defaultAsync ? "true" : "false"}`);
+	if (config.defaultTimeoutMs !== undefined || preserve("timeoutMs")) lines.push(`timeoutMs: ${config.defaultTimeoutMs ?? ""}`);
+	if (config.defaultToolTimeoutMs !== undefined || preserve("toolTimeoutMs")) lines.push(`toolTimeoutMs: ${config.defaultToolTimeoutMs ?? ""}`);
+	if (config.defaultTurnBudget || preserve("turnBudget")) lines.push(`turnBudget: ${config.defaultTurnBudget ? JSON.stringify(config.defaultTurnBudget) : ""}`);
+	if (config.defaultAcceptance !== undefined || preserve("acceptance")) {
+		lines.push(`acceptance: ${config.defaultAcceptance === undefined
+			? ""
+			: typeof config.defaultAcceptance === "object"
+				? JSON.stringify(config.defaultAcceptance)
+				: String(config.defaultAcceptance)}`);
+	}
+	if (config.acceptanceRole || preserve("acceptanceRole")) lines.push(`acceptanceRole: ${config.acceptanceRole ?? ""}`);
 
 	const skillsValue = joinComma(config.skills);
 	if (skillsValue || preserve("skill", "skills")) lines.push(`skills: ${skillsValue ?? ""}`);
+	const skillPathValue = joinComma(config.skillPath);
+	if (skillPathValue || preserve("skillPath")) lines.push(`skillPath: ${skillPathValue ?? ""}`);
 
 	if (config.extensions !== undefined) {
 		const extensionsValue = joinComma(config.extensions);
@@ -73,10 +113,11 @@ export function serializeAgent(config: AgentConfig, options: SerializeAgentOptio
 		lines.push(`subagentOnlyExtensions: ${subagentOnlyExtensionsValue ?? ""}`);
 	}
 
-	if (config.output) lines.push(`output: ${config.output}`);
+	if (config.output || preserve("output")) lines.push(`output: ${config.output ?? ""}`);
+	if (config.outputMode || preserve("outputMode")) lines.push(`outputMode: ${config.outputMode ?? ""}`);
 
 	const readsValue = joinComma(config.defaultReads);
-	if (readsValue) lines.push(`defaultReads: ${readsValue}`);
+	if (readsValue || preserve("defaultReads")) lines.push(`defaultReads: ${readsValue ?? ""}`);
 
 	if (config.defaultProgress) lines.push("defaultProgress: true");
 	if (config.interactive) lines.push("interactive: true");
@@ -86,6 +127,22 @@ export function serializeAgent(config: AgentConfig, options: SerializeAgentOptio
 	}
 	if (config.completionGuard === false || preserve("completionGuard")) {
 		lines.push(`completionGuard: ${config.completionGuard === undefined ? "" : config.completionGuard ? "true" : "false"}`);
+	}
+	if (config.toolBudget || preserve("toolBudget")) {
+		lines.push(`toolBudget: ${config.toolBudget ? JSON.stringify(config.toolBudget) : ""}`);
+	}
+	if (config.permissions || preserve("permission", "permissions")) {
+		const key = preserve("permission") && !preserve("permissions") ? "permission" : "permissions";
+		lines.push(`${key}:`);
+		if (config.permissions) {
+			for (const line of stringifyYaml(config.permissions).trimEnd().split("\n")) lines.push(`  ${line}`);
+		}
+	}
+
+	if (config.memory) {
+		lines.push("memory:");
+		lines.push(`  scope: ${config.memory.scope}`);
+		lines.push(`  path: ${config.memory.path}`);
 	}
 
 	if (config.extraFields) {

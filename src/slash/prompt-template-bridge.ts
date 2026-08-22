@@ -1,102 +1,36 @@
-export const PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT = "prompt-template:subagent:request";
-export const PROMPT_TEMPLATE_SUBAGENT_STARTED_EVENT = "prompt-template:subagent:started";
-export const PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT = "prompt-template:subagent:response";
-export const PROMPT_TEMPLATE_SUBAGENT_UPDATE_EVENT = "prompt-template:subagent:update";
-export const PROMPT_TEMPLATE_SUBAGENT_CANCEL_EVENT = "prompt-template:subagent:cancel";
+import {
+	SUBAGENT_DELEGATION_CANCEL_EVENT,
+	SUBAGENT_DELEGATION_REQUEST_EVENT,
+	SUBAGENT_DELEGATION_RESPONSE_EVENT,
+	SUBAGENT_DELEGATION_STARTED_EVENT,
+	SUBAGENT_DELEGATION_UPDATE_EVENT,
+	type SubagentDelegationInvalidResponse,
+	type SubagentDelegationRequest,
+	type SubagentDelegationResponse,
+} from "../api/delegation.ts";
+import { parseSubagentDelegationRequest } from "./delegation-request.ts";
+import {
+	parsePromptTemplateRequest,
+	toDelegationUpdate,
+	toPromptTemplateResponse,
+	toSubagentDelegationExecutionParams,
+	toSubagentDelegationResponse,
+	toSubagentDelegationUpdate,
+	type DelegatedSubagentExecutionParams,
+	type PromptTemplateBridgeResult,
+	type PromptTemplateDelegationRequest,
+	type PromptTemplateDelegationResponse,
+} from "./delegation-adapters.ts";
 
-interface PromptTemplateDelegationTask {
-	agent: string;
-	task: string;
-	model?: string;
-	cwd?: string;
-}
-
-interface PromptTemplateDelegationParallelResult {
-	agent: string;
-	messages: unknown[];
-	isError: boolean;
-	errorText?: string;
-}
-
-interface PromptTemplateDelegationRequest {
-	requestId: string;
-	agent: string;
-	task: string;
-	tasks?: PromptTemplateDelegationTask[];
-	context: "fresh" | "fork";
-	model: string;
-	cwd: string;
-	worktree?: boolean;
-}
-
-interface PromptTemplateDelegationResponse extends PromptTemplateDelegationRequest {
-	messages: unknown[];
-	parallelResults?: PromptTemplateDelegationParallelResult[];
-	contentText?: string;
-	isError: boolean;
-	errorText?: string;
-}
-
-interface PromptTemplateDelegationTaskProgress {
-	index?: number;
-	agent: string;
-	status?: string;
-	currentTool?: string;
-	currentToolArgs?: string;
-	recentOutput?: string;
-	recentOutputLines?: string[];
-	recentTools?: Array<{ tool: string; args: string }>;
-	model?: string;
-	toolCount?: number;
-	durationMs?: number;
-	tokens?: number;
-}
-
-interface PromptTemplateDelegationUpdate {
-	requestId: string;
-	currentTool?: string;
-	currentToolArgs?: string;
-	recentOutput?: string;
-	recentOutputLines?: string[];
-	recentTools?: Array<{ tool: string; args: string }>;
-	model?: string;
-	toolCount?: number;
-	durationMs?: number;
-	tokens?: number;
-	taskProgress?: PromptTemplateDelegationTaskProgress[];
-}
+export const PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT = SUBAGENT_DELEGATION_REQUEST_EVENT;
+export const PROMPT_TEMPLATE_SUBAGENT_STARTED_EVENT = SUBAGENT_DELEGATION_STARTED_EVENT;
+export const PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT = SUBAGENT_DELEGATION_RESPONSE_EVENT;
+export const PROMPT_TEMPLATE_SUBAGENT_UPDATE_EVENT = SUBAGENT_DELEGATION_UPDATE_EVENT;
+export const PROMPT_TEMPLATE_SUBAGENT_CANCEL_EVENT = SUBAGENT_DELEGATION_CANCEL_EVENT;
 
 export interface PromptTemplateBridgeEvents {
 	on(event: string, handler: (data: unknown) => void): (() => void) | void;
 	emit(event: string, data: unknown): void;
-}
-
-interface PromptTemplateBridgeResult {
-	isError?: boolean;
-	content?: unknown;
-	details?: {
-		results?: Array<{
-			agent?: string;
-			messages?: unknown[];
-			finalOutput?: string;
-			toolCalls?: Array<{ text?: string; expandedText?: string }>;
-			exitCode?: number;
-			error?: string;
-			model?: string;
-		}>;
-		progress?: Array<{
-			index?: number;
-			agent?: string;
-			status?: string;
-			currentTool?: string;
-			currentToolArgs?: string;
-			recentOutput?: string[];
-			recentTools?: Array<{ tool?: string; args?: string }>;
-			toolCount?: number;
-			durationMs?: number;
-			tokens?: number;
-		}>;
-	};
 }
 
 interface PromptTemplateBridgeOptions<Ctx extends { cwd?: string }> {
@@ -104,185 +38,32 @@ interface PromptTemplateBridgeOptions<Ctx extends { cwd?: string }> {
 	getContext: () => Ctx | null;
 	execute: (
 		requestId: string,
-		request: PromptTemplateDelegationRequest,
+		params: DelegatedSubagentExecutionParams,
+		signal: AbortSignal,
+		ctx: Ctx,
+		onUpdate: (result: PromptTemplateBridgeResult) => void,
+	) => Promise<PromptTemplateBridgeResult>;
+	/** Concurrent-safe executor for structured delegation requests. */
+	executeStructured?: (
+		requestId: string,
+		params: DelegatedSubagentExecutionParams,
 		signal: AbortSignal,
 		ctx: Ctx,
 		onUpdate: (result: PromptTemplateBridgeResult) => void,
 	) => Promise<PromptTemplateBridgeResult>;
 }
 
-function parseDelegationTasks(tasks: unknown): PromptTemplateDelegationTask[] {
-	if (!Array.isArray(tasks)) return [];
-	const parsed: PromptTemplateDelegationTask[] = [];
-	for (const item of tasks) {
-		if (!item || typeof item !== "object") return [];
-		const value = item as Partial<PromptTemplateDelegationTask>;
-		if (typeof value.agent !== "string" || !value.agent.trim()) return [];
-		if (typeof value.task !== "string" || !value.task.trim()) return [];
-		const model = typeof value.model === "string" && value.model.trim().length > 0 ? value.model : undefined;
-		const cwd = typeof value.cwd === "string" && value.cwd.trim().length > 0 ? value.cwd : undefined;
-		parsed.push({
-			agent: value.agent,
-			task: value.task,
-			...(model ? { model } : {}),
-			...(cwd ? { cwd } : {}),
-		});
-	}
-	return parsed;
+function hasStructuredDelegationMarker(data: unknown): boolean {
+	if (!data || typeof data !== "object" || Array.isArray(data)) return false;
+	const value = data as Record<string, unknown>;
+	return Object.hasOwn(value, "ownerRunId")
+		|| Object.hasOwn(value, "nodeId")
+		|| Object.hasOwn(value, "result")
+		|| Object.hasOwn(value, "version");
 }
 
-function parsePromptTemplateRequest(data: unknown): PromptTemplateDelegationRequest | undefined {
-	if (!data || typeof data !== "object") return undefined;
-	const value = data as Partial<PromptTemplateDelegationRequest> & { tasks?: unknown };
-	if (typeof value.requestId !== "string" || !value.requestId) return undefined;
-	if (typeof value.model !== "string" || !value.model) return undefined;
-	if (typeof value.cwd !== "string" || !value.cwd) return undefined;
-	if (value.context !== "fresh" && value.context !== "fork") return undefined;
-	const tasks = parseDelegationTasks(value.tasks);
-	const worktree = value.worktree === true ? true : undefined;
-	const hasSingle =
-		typeof value.agent === "string" &&
-		value.agent.length > 0 &&
-		typeof value.task === "string" &&
-		value.task.length > 0;
-	if (!hasSingle && tasks.length === 0) return undefined;
-
-	const fallbackTask = tasks[0];
-	return {
-		requestId: value.requestId,
-		agent: hasSingle ? value.agent : fallbackTask!.agent,
-		task: hasSingle ? value.task : fallbackTask!.task,
-		...(tasks.length > 0 ? { tasks } : {}),
-		context: value.context,
-		model: value.model,
-		cwd: value.cwd,
-		...(worktree ? { worktree } : {}),
-	};
-}
-
-function firstTextContent(content: unknown): string | undefined {
-	if (!Array.isArray(content)) return undefined;
-	for (const part of content) {
-		if (!part || typeof part !== "object") continue;
-		if ((part as { type?: string }).type !== "text") continue;
-		const text = (part as { text?: unknown }).text;
-		if (typeof text === "string" && text.trim()) return text.trim();
-	}
-	return undefined;
-}
-
-function filterRecentOutput(lines: string[] | undefined): string[] | undefined {
-	if (!lines || lines.length === 0) return undefined;
-	const filtered = lines.filter((line) => typeof line === "string" && line.trim() && line.trim() !== "(running...)");
-	if (filtered.length === 0) return undefined;
-	return filtered;
-}
-
-function sanitizeRecentTools(
-	tools: Array<{ tool?: string; args?: string }> | undefined,
-): Array<{ tool: string; args: string }> | undefined {
-	if (!tools || tools.length === 0) return undefined;
-	const sanitized = tools.flatMap((entry) => {
-		if (typeof entry.tool !== "string" || entry.tool.trim().length === 0) return [];
-		return [{
-			tool: entry.tool,
-			args: typeof entry.args === "string" ? entry.args : String(entry.args ?? ""),
-		}];
-	});
-	return sanitized.length > 0 ? sanitized : undefined;
-}
-
-function resolveProgressModel(
-	update: PromptTemplateBridgeResult,
-	entry: { index?: number; agent?: string },
-): string | undefined {
-	const results = update.details?.results;
-	if (!results || results.length === 0) return undefined;
-	if (typeof entry.index === "number" && entry.index >= 0) {
-		const byIndex = results[entry.index];
-		if (typeof byIndex?.model === "string") return byIndex.model;
-	}
-	if (entry.agent) {
-		const byAgent = results.find((result) => result.agent === entry.agent && typeof result.model === "string");
-		if (byAgent?.model) return byAgent.model;
-	}
-	const firstWithModel = results.find((result) => typeof result.model === "string");
-	return firstWithModel?.model;
-}
-
-function toolCallNameFromSummary(summary: { text?: string; expandedText?: string }): string | undefined {
-	const text = typeof summary.expandedText === "string" && summary.expandedText.trim().length > 0
-		? summary.expandedText.trim()
-		: typeof summary.text === "string"
-			? summary.text.trim()
-			: "";
-	if (!text) return undefined;
-	if (text.startsWith("$ ")) return "bash";
-	return text.match(/^[A-Za-z_][\w.-]*/)?.[0];
-}
-
-function buildDelegationMessages(
-	result: { messages?: unknown[]; finalOutput?: string; toolCalls?: Array<{ text?: string; expandedText?: string }> },
-	fallbackText?: string,
-): unknown[] {
-	if (Array.isArray(result.messages) && result.messages.length > 0) return result.messages;
-	const toolCallParts = (result.toolCalls ?? []).flatMap((summary) => {
-		const name = toolCallNameFromSummary(summary);
-		return name ? [{ type: "toolCall", name, arguments: { summary: summary.expandedText ?? summary.text ?? "" } }] : [];
-	});
-	const text = typeof result.finalOutput === "string" && result.finalOutput.trim().length > 0
-		? result.finalOutput.trim()
-		: fallbackText;
-	const content = [
-		...toolCallParts,
-		...(text ? [{ type: "text", text }] : []),
-	];
-	if (content.length === 0) return [];
-	return [{ role: "assistant", content }];
-}
-
-function toDelegationUpdate(requestId: string, update: PromptTemplateBridgeResult): PromptTemplateDelegationUpdate | undefined {
-	const progress = update.details?.progress?.[0];
-	const taskProgress = update.details?.progress?.map((entry) => {
-		const lastOutput = entry.recentOutput?.[entry.recentOutput.length - 1];
-		const safeLastOutput =
-			typeof lastOutput === "string" && lastOutput.trim() && lastOutput !== "(running...)"
-				? lastOutput
-				: undefined;
-		return {
-			index: entry.index,
-			agent: entry.agent ?? "delegate",
-			status: entry.status,
-			currentTool: entry.currentTool,
-			currentToolArgs: entry.currentToolArgs,
-			recentOutput: safeLastOutput,
-			recentOutputLines: filterRecentOutput(entry.recentOutput),
-			recentTools: sanitizeRecentTools(entry.recentTools),
-			model: resolveProgressModel(update, entry),
-			toolCount: entry.toolCount,
-			durationMs: entry.durationMs,
-			tokens: entry.tokens,
-		};
-	});
-	if (!progress && (!taskProgress || taskProgress.length === 0)) return undefined;
-	const lastOutput = progress?.recentOutput?.[progress.recentOutput.length - 1];
-	const safeLastOutput =
-		typeof lastOutput === "string" && lastOutput.trim() && lastOutput !== "(running...)"
-			? lastOutput
-			: undefined;
-	return {
-		requestId,
-		currentTool: progress?.currentTool,
-		currentToolArgs: progress?.currentToolArgs,
-		recentOutput: safeLastOutput,
-		recentOutputLines: filterRecentOutput(progress?.recentOutput),
-		recentTools: sanitizeRecentTools(progress?.recentTools),
-		model: progress ? resolveProgressModel(update, progress) : undefined,
-		toolCount: progress?.toolCount,
-		durationMs: progress?.durationMs,
-		tokens: progress?.tokens,
-		taskProgress,
-	};
+function validId(value: unknown): value is string {
+	return typeof value === "string" && value.trim().length > 0 && value.length <= 256 && !/[\r\n]/.test(value);
 }
 
 export function registerPromptTemplateDelegationBridge<Ctx extends { cwd?: string }>(
@@ -291,130 +72,312 @@ export function registerPromptTemplateDelegationBridge<Ctx extends { cwd?: strin
 	cancelAll: () => void;
 	dispose: () => void;
 } {
-	const controllers = new Map<string, AbortController>();
-	const pendingCancels = new Set<string>();
+	const legacyControllers = new Map<string, AbortController>();
+	const pendingLegacyCancels = new Map<string, true>();
+	const attemptControllers = new Map<string, AbortController>();
+	const pendingAttemptCancels = new Map<string, true>();
+	const activeOwnedNodes = new Map<string, { attemptKey: string; controller: AbortController }>();
+	const settledAttempts = new Map<string, true>();
 	const subscriptions: Array<() => void> = [];
+	let disposed = false;
+	let identitySaturated = false;
 
 	const subscribe = (event: string, handler: (data: unknown) => void): void => {
 		const unsubscribe = options.events.on(event, handler);
 		if (typeof unsubscribe === "function") subscriptions.push(unsubscribe);
 	};
+	const ownsLegacyRequest = (requestId: string, controller: AbortController): boolean =>
+		!disposed && legacyControllers.get(requestId) === controller;
+	const ownsAttempt = (attemptKey: string, controller: AbortController): boolean =>
+		!disposed && attemptControllers.get(attemptKey) === controller;
+	const boundedRemember = (map: Map<string, true>, key: string): void => {
+		map.delete(key);
+		map.set(key, true);
+		while (map.size > 256) {
+			const oldest = map.keys().next().value;
+			if (typeof oldest !== "string") break;
+			map.delete(oldest);
+		}
+	};
+	const rememberIdentity = (map: Map<string, true>, key: string): void => {
+		if (map.has(key) || identitySaturated) return;
+		if (map.size >= 8_192) {
+			identitySaturated = true;
+			return;
+		}
+		map.set(key, true);
+		if (map.size === 8_192) {
+			// Exact cancellation and terminal-attempt facts are security state, not an
+			// LRU cache. Once full, fail closed rather than evicting identity facts.
+			identitySaturated = true;
+		}
+	};
+	const nodeKey = (ownerRunId: string, nodeId: string): string => JSON.stringify([ownerRunId, nodeId]);
+	const attemptKey = (requestId: string, ownerRunId: string, nodeId: string): string => JSON.stringify([requestId, ownerRunId, nodeId]);
+	const rememberPendingLegacyCancel = (requestId: string): void => {
+		boundedRemember(pendingLegacyCancels, requestId);
+	};
+	const emitTerminal = (key: string, payload: SubagentDelegationResponse): void => {
+		if (disposed || settledAttempts.has(key)) return;
+		rememberIdentity(settledAttempts, key);
+		options.events.emit(SUBAGENT_DELEGATION_RESPONSE_EVENT, payload);
+	};
 
 	subscribe(PROMPT_TEMPLATE_SUBAGENT_CANCEL_EVENT, (data) => {
-		if (!data || typeof data !== "object") return;
-		const requestId = (data as { requestId?: unknown }).requestId;
-		if (typeof requestId !== "string") return;
-		const controller = controllers.get(requestId);
+		if (!data || typeof data !== "object" || Array.isArray(data)) return;
+		const value = data as Record<string, unknown>;
+		const requestId = value.requestId;
+		if (!validId(requestId)) return;
+		if (hasStructuredDelegationMarker(data)) {
+			if (Object.keys(value).some((key) => key !== "requestId" && key !== "ownerRunId" && key !== "nodeId")) return;
+			const ownerRunId = value.ownerRunId;
+			const nodeId = value.nodeId;
+			if (!validId(ownerRunId) || !validId(nodeId)) return;
+			const key = attemptKey(requestId, ownerRunId, nodeId);
+			const controller = attemptControllers.get(key);
+			if (controller) controller.abort();
+			else rememberIdentity(pendingAttemptCancels, key);
+			return;
+		}
+		const controller = legacyControllers.get(requestId);
 		if (controller) {
 			controller.abort();
 			return;
 		}
-		pendingCancels.add(requestId);
+		rememberPendingLegacyCancel(requestId);
 	});
 
 	subscribe(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, async (data) => {
-		const request = parsePromptTemplateRequest(data);
-		if (!request) return;
+		const structuredPayload = hasStructuredDelegationMarker(data);
+		let requestId: string;
+		let params: DelegatedSubagentExecutionParams;
+		let structuredRequest: SubagentDelegationRequest | undefined;
+		let key: string | undefined;
+		let legacyRequest: PromptTemplateDelegationRequest | undefined;
 
-		const ctx = options.getContext();
-		if (!ctx) {
-			const response: PromptTemplateDelegationResponse = {
-				...request,
+		if (structuredPayload) {
+			const parsed = parseSubagentDelegationRequest(data);
+			if (parsed.ok === false) {
+				if (!disposed && parsed.requestId) {
+					const payload = {
+						requestId: parsed.requestId,
+						...(parsed.ownerRunId ? { ownerRunId: parsed.ownerRunId } : {}),
+						...(parsed.nodeId ? { nodeId: parsed.nodeId } : {}),
+						status: "invalid_request",
+						error: parsed.error,
+					} satisfies SubagentDelegationInvalidResponse;
+					if (parsed.ownerRunId && parsed.nodeId) {
+						const attemptedKey = attemptKey(parsed.requestId, parsed.ownerRunId, parsed.nodeId);
+						if (!attemptControllers.has(attemptedKey)) emitTerminal(attemptedKey, payload);
+					} else {
+						options.events.emit(SUBAGENT_DELEGATION_RESPONSE_EVENT, payload);
+					}
+				}
+				return;
+			}
+			structuredRequest = parsed.request;
+			requestId = parsed.request.requestId;
+			key = attemptKey(requestId, parsed.request.ownerRunId, parsed.request.nodeId);
+			params = toSubagentDelegationExecutionParams(parsed.request);
+		} else {
+			if (data && typeof data === "object" && !Array.isArray(data)) {
+				const legacy = data as Record<string, unknown>;
+				if ((legacy.tasks !== undefined || legacy.worktree !== undefined) && typeof legacy.requestId === "string" && legacy.requestId) {
+					options.events.emit(PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT, {
+						requestId: legacy.requestId,
+						messages: [],
+						isError: true,
+						errorText: "Legacy prompt-template tasks/worktree orchestration was removed; use workflowScript.",
+					});
+					return;
+				}
+			}
+			legacyRequest = parsePromptTemplateRequest(data);
+			if (!legacyRequest) return;
+			options.events.emit(PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT, {
+				...legacyRequest,
 				messages: [],
 				isError: true,
-				errorText: "No active extension context for delegated subagent execution.",
-			};
-			options.events.emit(PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT, response);
+				errorText: "Legacy prompt-template direct delegation was removed; use workflowScript through the subagent tool or structured delegation.",
+			} satisfies PromptTemplateDelegationResponse);
+			return;
+		}
+
+		if (!structuredRequest && legacyControllers.has(requestId)) return;
+		if (structuredRequest && key) {
+			if (attemptControllers.has(key) || settledAttempts.has(key)) return;
+			if (pendingAttemptCancels.delete(key)) {
+				emitTerminal(key, {
+					requestId,
+					ownerRunId: structuredRequest.ownerRunId,
+					nodeId: structuredRequest.nodeId,
+					status: "cancelled",
+				});
+				return;
+			}
+			if (identitySaturated) {
+				options.events.emit(SUBAGENT_DELEGATION_RESPONSE_EVENT, {
+					requestId,
+					ownerRunId: structuredRequest.ownerRunId,
+					nodeId: structuredRequest.nodeId,
+					status: "unavailable_context",
+					error: "Delegation identity capacity is exhausted for this extension context.",
+				} satisfies SubagentDelegationResponse);
+				return;
+			}
+			const active = activeOwnedNodes.get(nodeKey(structuredRequest.ownerRunId, structuredRequest.nodeId));
+			if (active) {
+				emitTerminal(key, {
+					requestId,
+					ownerRunId: structuredRequest.ownerRunId,
+					nodeId: structuredRequest.nodeId,
+					status: "duplicate_node",
+				});
+				return;
+			}
+		}
+		const ctx = options.getContext();
+		if (!ctx) {
+			if (structuredRequest && key) {
+				emitTerminal(key, {
+					requestId,
+					ownerRunId: structuredRequest.ownerRunId,
+					nodeId: structuredRequest.nodeId,
+					status: "unavailable_context",
+					error: "No active extension context for delegated subagent execution.",
+				});
+			} else if (legacyRequest) {
+				options.events.emit(PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT, {
+					...legacyRequest,
+					messages: [],
+					isError: true,
+					errorText: "No active extension context for delegated subagent execution.",
+				} satisfies PromptTemplateDelegationResponse);
+			}
 			return;
 		}
 
 		const controller = new AbortController();
-		controllers.set(request.requestId, controller);
-
-		if (pendingCancels.delete(request.requestId)) {
-			controller.abort();
-			const response: PromptTemplateDelegationResponse = {
-				...request,
-				messages: [],
-				isError: true,
-				errorText: "Delegated prompt cancelled.",
-			};
-			options.events.emit(PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT, response);
-			controllers.delete(request.requestId);
+		if (structuredRequest && key) {
+			attemptControllers.set(key, controller);
+			activeOwnedNodes.set(nodeKey(structuredRequest.ownerRunId, structuredRequest.nodeId), { attemptKey: key, controller });
+		} else {
+			legacyControllers.set(requestId, controller);
+			if (pendingLegacyCancels.delete(requestId)) controller.abort();
+		}
+		if (controller.signal.aborted) {
+			if (structuredRequest && key) {
+				emitTerminal(key, {
+					requestId,
+					ownerRunId: structuredRequest.ownerRunId,
+					nodeId: structuredRequest.nodeId,
+					status: "cancelled",
+				});
+				activeOwnedNodes.delete(nodeKey(structuredRequest.ownerRunId, structuredRequest.nodeId));
+			} else if (legacyRequest) {
+				options.events.emit(PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT, {
+					...legacyRequest,
+					messages: [],
+					isError: true,
+					errorText: "Delegated prompt cancelled.",
+				} satisfies PromptTemplateDelegationResponse);
+			}
+			if (key) attemptControllers.delete(key);
+			else legacyControllers.delete(requestId);
 			return;
 		}
 
-		options.events.emit(PROMPT_TEMPLATE_SUBAGENT_STARTED_EVENT, { requestId: request.requestId });
+		options.events.emit(
+			structuredRequest ? SUBAGENT_DELEGATION_STARTED_EVENT : PROMPT_TEMPLATE_SUBAGENT_STARTED_EVENT,
+			structuredRequest
+				? { requestId, ownerRunId: structuredRequest.ownerRunId, nodeId: structuredRequest.nodeId }
+				: { requestId },
+		);
 
 		try {
-			const result = await options.execute(
-				request.requestId,
-				request,
+			const executeRequest = structuredRequest && options.executeStructured
+				? options.executeStructured
+				: options.execute;
+			const result = await executeRequest(
+				requestId,
+				params,
 				controller.signal,
 				ctx,
 				(update) => {
-					const payload = toDelegationUpdate(request.requestId, update);
-					if (!payload) return;
-					options.events.emit(PROMPT_TEMPLATE_SUBAGENT_UPDATE_EVENT, payload);
+					if (key ? !ownsAttempt(key, controller) : !ownsLegacyRequest(requestId, controller)) return;
+					if (structuredRequest) {
+						const payload = toSubagentDelegationUpdate(structuredRequest, update);
+						if (payload) options.events.emit(SUBAGENT_DELEGATION_UPDATE_EVENT, payload);
+						return;
+					}
+					const payload = toDelegationUpdate(requestId, update);
+					if (payload) options.events.emit(PROMPT_TEMPLATE_SUBAGENT_UPDATE_EVENT, payload);
 				},
 			);
-			const contentText = firstTextContent(result.content);
-			const messages = buildDelegationMessages(result.details?.results?.[0] ?? {}, contentText);
-			const parallelResults = request.tasks
-				? request.tasks.map<PromptTemplateDelegationParallelResult>((task, index) => {
-					const step = result.details?.results?.[index];
-					if (!step) {
-						return {
-							agent: task.agent,
-							messages: [],
-							isError: true,
-							errorText: "Missing result for delegated parallel task.",
-						};
-					}
-					const exitCode = typeof step.exitCode === "number" ? step.exitCode : undefined;
-					const errorText = step.error;
-					return {
-						agent: step.agent ?? task.agent,
-						messages: buildDelegationMessages(step),
-						isError: (exitCode !== undefined && exitCode !== 0) || !!errorText,
-						errorText: errorText || undefined,
-					};
-				})
-				: undefined;
-			const response: PromptTemplateDelegationResponse = {
-				...request,
-				messages,
-				...(parallelResults ? { parallelResults } : {}),
-				...(contentText ? { contentText } : {}),
-				isError: result.isError === true,
-				errorText: result.isError ? contentText : undefined,
-			};
-			options.events.emit(PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT, response);
+			if (key ? !ownsAttempt(key, controller) : !ownsLegacyRequest(requestId, controller)) return;
+			if (structuredRequest && key) {
+				emitTerminal(key, toSubagentDelegationResponse(structuredRequest, result, controller.signal.aborted));
+			} else if (legacyRequest) {
+				options.events.emit(
+					PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT,
+					controller.signal.aborted
+						? { ...legacyRequest, messages: [], isError: true, errorText: "Delegated prompt cancelled." }
+						: toPromptTemplateResponse(legacyRequest, result),
+				);
+			}
 		} catch (error) {
-			const response: PromptTemplateDelegationResponse = {
-				...request,
-				messages: [],
-				isError: true,
-				errorText: error instanceof Error ? error.message : String(error),
-			};
-			options.events.emit(PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT, response);
+			if (key ? !ownsAttempt(key, controller) : !ownsLegacyRequest(requestId, controller)) return;
+			if (structuredRequest && key) {
+				emitTerminal(key, {
+					requestId,
+					ownerRunId: structuredRequest.ownerRunId,
+					nodeId: structuredRequest.nodeId,
+					status: controller.signal.aborted ? "cancelled" : "failed",
+					...(controller.signal.aborted ? {} : { error: error instanceof Error ? error.message : String(error) }),
+				});
+			} else if (legacyRequest) {
+				options.events.emit(PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT, {
+					...legacyRequest,
+					messages: [],
+					isError: true,
+					errorText: error instanceof Error ? error.message : String(error),
+				} satisfies PromptTemplateDelegationResponse);
+			}
 		} finally {
-			controllers.delete(request.requestId);
+			if (key) {
+				if (attemptControllers.get(key) === controller) attemptControllers.delete(key);
+			} else if (legacyControllers.get(requestId) === controller) legacyControllers.delete(requestId);
+			if (structuredRequest) {
+				const ownedNodeKey = nodeKey(structuredRequest.ownerRunId, structuredRequest.nodeId);
+				if (activeOwnedNodes.get(ownedNodeKey)?.controller === controller) activeOwnedNodes.delete(ownedNodeKey);
+			}
 		}
 	});
 
 	return {
 		cancelAll: () => {
-			for (const controller of controllers.values()) {
-				controller.abort();
-			}
-			controllers.clear();
-			pendingCancels.clear();
+			for (const controller of legacyControllers.values()) controller.abort();
+			for (const controller of attemptControllers.values()) controller.abort();
+			legacyControllers.clear();
+			attemptControllers.clear();
+			pendingLegacyCancels.clear();
+			pendingAttemptCancels.clear();
+			activeOwnedNodes.clear();
+			settledAttempts.clear();
+			identitySaturated = false;
 		},
 		dispose: () => {
+			disposed = true;
+			for (const controller of legacyControllers.values()) controller.abort();
+			for (const controller of attemptControllers.values()) controller.abort();
+			legacyControllers.clear();
+			attemptControllers.clear();
 			for (const unsubscribe of subscriptions) unsubscribe();
 			subscriptions.length = 0;
-			pendingCancels.clear();
+			pendingLegacyCancels.clear();
+			pendingAttemptCancels.clear();
+			activeOwnedNodes.clear();
+			settledAttempts.clear();
 		},
 	};
 }

@@ -2,15 +2,19 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { discoverAgentsAll, type AgentSource } from "../agents/agents.ts";
 import { isAsyncAvailable } from "../runs/background/async-execution.ts";
+import { formatSpawnBudgetSummary, getSpawnBudgetSnapshot } from "../runs/shared/spawn-budget.ts";
+import { getActiveAsyncCapacitySnapshot, resolveMaxActiveAsyncRunsPerSession } from "../runs/background/active-async-capacity.ts";
+import { decodeRunFanoutBudgetDescriptor, formatRunFanoutBudget, getRunFanoutBudgetSnapshot, RUN_FANOUT_BUDGET_ENV } from "../runs/shared/run-fanout-budget.ts";
 import { diagnoseIntercomBridge, type IntercomBridgeDiagnostic } from "../intercom/intercom-bridge.ts";
 import { discoverAvailableSkills, type SkillSource } from "../agents/skills.ts";
 import {
-	ASYNC_DIR,
+	DIRS,
 	CHAIN_RUNS_DIR,
-	RESULTS_DIR,
 	TEMP_ROOT_DIR,
 	type ExtensionConfig,
 	type SubagentState,
+	normalizeMaxSubagentSpawnsPerRun,
+	resolveMaxSubagentSpawnsPerRun,
 } from "../shared/types.ts";
 
 interface DoctorPaths {
@@ -42,12 +46,14 @@ interface DoctorReportInput {
 	deps?: Partial<DoctorDeps>;
 }
 
-const DEFAULT_PATHS: DoctorPaths = {
-	tempRootDir: TEMP_ROOT_DIR,
-	asyncDir: ASYNC_DIR,
-	resultsDir: RESULTS_DIR,
-	chainRunsDir: CHAIN_RUNS_DIR,
-};
+function defaultPaths(): DoctorPaths {
+	return {
+		tempRootDir: TEMP_ROOT_DIR,
+		asyncDir: DIRS.async,
+		resultsDir: DIRS.results,
+		chainRunsDir: CHAIN_RUNS_DIR,
+	};
+}
 
 const DEFAULT_DEPS: DoctorDeps = {
 	isAsyncAvailable,
@@ -128,21 +134,19 @@ function formatSessionLines(input: DoctorReportInput): string[] {
 
 function formatDiscovery(input: DoctorReportInput, deps: DoctorDeps): string[] {
 	return [
-		lineFromCheck("agents/chains", () => {
+		lineFromCheck("agents", () => {
 			const discovered = deps.discoverAgentsAll(input.cwd);
 			const agentCounts = {
 				builtin: discovered.builtin.length,
 				package: discovered.package?.length ?? 0,
 				user: discovered.user.length,
 				project: discovered.project.length,
+				runtime: 0,
 			};
-			const chainCounts = discovered.chains.reduce<Record<AgentSource, number>>((counts, chain) => {
-				counts[chain.source] += 1;
-				return counts;
-			}, { builtin: 0, package: 0, user: 0, project: 0 });
+			const diagnostics = discovered.agentDiagnostics ?? [];
 			return [
 				`- agents: total ${agentCounts.builtin + agentCounts.package + agentCounts.user + agentCounts.project} (${formatSourceCounts(agentCounts)})`,
-				`- chains: total ${discovered.chains.length} (${formatSourceCounts(chainCounts)})`,
+				...diagnostics.map((diagnostic) => `- invalid agent ${diagnostic.name ?? diagnostic.filePath} (${diagnostic.source}): ${diagnostic.error}`),
 			].join("\n");
 		}),
 		lineFromCheck("skills", () => {
@@ -157,15 +161,50 @@ function formatIntercomDiagnostic(diagnostic: IntercomBridgeDiagnostic, context:
 		`- bridge: ${diagnostic.active ? "active" : "inactive"}${diagnostic.reason ? ` (${diagnostic.reason})` : ""}`,
 		`- mode: ${diagnostic.mode}; context: ${context ?? "unspecified"}`,
 		`- orchestrator target: ${diagnostic.orchestratorTarget ?? "not available"}`,
-		`- pi-intercom: ${diagnostic.piIntercomAvailable ? "available" : "unavailable"} at ${diagnostic.extensionDir}`,
+		`- supervisor channel: ${diagnostic.supervisorChannelAvailable ? "available" : "unavailable"} (${diagnostic.extensionDir})`,
 	];
-	if (diagnostic.configPath && diagnostic.intercomConfigEnabled !== undefined) {
-		lines.push(`- intercom config: ${diagnostic.intercomConfigEnabled === false ? "disabled" : "enabled or absent"} (${diagnostic.configPath})`);
-	}
-	if (diagnostic.intercomConfigError) {
-		lines.push(`- intercom config warning: ${diagnostic.intercomConfigError}; runtime assumes enabled`);
-	}
 	return lines;
+}
+
+function formatSpawnBudgetSection(input: DoctorReportInput): string[] {
+	const snapshot = getSpawnBudgetSnapshot(input.state, input.config, input.currentSessionId ?? input.state.currentSessionId);
+	return [
+		`- usage: ${formatSpawnBudgetSummary(snapshot)}`,
+		`- recent grants: ${snapshot.grantHistory.length === 0
+			? "none"
+			: snapshot.grantHistory.map((grant) => `+${grant.amount} at ${new Date(grant.grantedAt).toISOString()} (${grant.previousLimit} → ${grant.limit})`).join("; ")}`,
+		"- reset boundary: a new parent session resets usage and grants; compaction does not",
+	];
+}
+
+function formatRunFanoutSection(input: DoctorReportInput): string[] {
+	try {
+		const inherited = decodeRunFanoutBudgetDescriptor(process.env[RUN_FANOUT_BUDGET_ENV]);
+		if (inherited) {
+			return [`- usage: ${formatRunFanoutBudget(getRunFanoutBudgetSnapshot(inherited)).replace(/^Run fan-out: /, "")}`, `- root run: ${inherited.rootRunId}`, "- reset boundary: cumulative claims are never released; a new top-level run creates a new budget"];
+		}
+	} catch (error) {
+		return [`- inherited budget: invalid — ${errorText(error)}`];
+	}
+	const configured = resolveMaxSubagentSpawnsPerRun(input.config.maxSubagentSpawnsPerRun);
+	const source = normalizeMaxSubagentSpawnsPerRun(process.env.PI_SUBAGENT_MAX_SPAWNS_PER_RUN) !== undefined
+		? "environment"
+		: normalizeMaxSubagentSpawnsPerRun(input.config.maxSubagentSpawnsPerRun) !== undefined ? "config" : "default";
+	return [`- configured limit: ${configured} (${source})`, "- usage: available after a run starts", "- reset boundary: cumulative claims are never released; a new top-level run creates a new budget"];
+}
+
+function formatActiveAsyncCapacitySection(input: DoctorReportInput): string[] {
+	const limit = resolveMaxActiveAsyncRunsPerSession(input.config.maxActiveAsyncRunsPerSession);
+	const sessionId = input.currentSessionId ?? input.state.currentSessionId;
+	const snapshot = sessionId
+		? getActiveAsyncCapacitySnapshot(sessionId, limit, { liveWorkflowRunIds: new Set(input.state.workflowControllers?.keys() ?? []) })
+		: { used: 0, limit: limit ?? 0 };
+	input.state.activeAsyncCapacity = snapshot;
+	return [
+		`- usage: ${snapshot.used}/${snapshot.limit || "unlimited"} used`,
+		"- scope: top-level async runs in the current parent session; foreground and nested workflow children are not charged again",
+		"- release: terminal logical state plus verified process exit; missing or unknown cleanup proof retains capacity",
+	];
 }
 
 function formatPermissionSystemSection(): string[] {
@@ -185,8 +224,15 @@ function formatPermissionSystemSection(): string[] {
 	return lines;
 }
 
+function formatWorkflowScriptSection(): string[] {
+	return [
+		"- helpers: runs.run, runs.all, runs.steer, runs.status, runs.ref/refs, emit, console",
+		"- recovery: if runs.all is missing, reload or update pi-subagents; await Promise.all([runs.run(...)]) is also supported",
+	];
+}
+
 export function buildDoctorReport(input: DoctorReportInput): string {
-	const paths = input.paths ?? DEFAULT_PATHS;
+	const paths = input.paths ?? defaultPaths();
 	const deps = { ...DEFAULT_DEPS, ...input.deps };
 	const lines = [
 		"Subagents doctor report",
@@ -204,6 +250,18 @@ export function buildDoctorReport(input: DoctorReportInput): string {
 		"",
 		"Discovery",
 		...formatDiscovery(input, deps),
+		"",
+		"Spawn budget",
+		...formatSpawnBudgetSection(input),
+		"",
+		"Run fan-out budget",
+		...formatRunFanoutSection(input),
+		"",
+		"Active async capacity",
+		...formatActiveAsyncCapacitySection(input),
+		"",
+		"Workflow script",
+		...formatWorkflowScriptSection(),
 		"",
 		"Permission system",
 		...formatPermissionSystemSection(),

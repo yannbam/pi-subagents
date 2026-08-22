@@ -6,6 +6,7 @@ import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { parseFrontmatter } from "./frontmatter.ts";
 import { getAgentDir, getProjectConfigDir } from "../shared/utils.ts";
 
 export type SkillSource =
@@ -122,9 +123,26 @@ function extractSkillPathsFromPackageRoot(packageRoot: string, source: SkillSour
 let cachedGlobalNpmRoot: string | null = null;
 
 function getGlobalNpmRoot(): string | null {
+	const offline = process.env.PI_OFFLINE?.toLowerCase();
+	if (offline === "1" || offline === "true" || offline === "yes") return null;
 	if (cachedGlobalNpmRoot !== null) return cachedGlobalNpmRoot;
+
+	const windowsGlobalRoot = process.platform === "win32" && process.env.APPDATA
+		? path.join(process.env.APPDATA, "npm", "node_modules")
+		: undefined;
+	if (windowsGlobalRoot) {
+		try {
+			if (fs.statSync(windowsGlobalRoot).isDirectory()) {
+				cachedGlobalNpmRoot = fs.realpathSync(windowsGlobalRoot);
+				return cachedGlobalNpmRoot;
+			}
+		} catch {
+			// Fall through if the directory disappears while resolving it.
+		}
+	}
+
 	try {
-		cachedGlobalNpmRoot = execSync("npm root -g", { encoding: "utf-8", timeout: 5000 }).trim();
+		cachedGlobalNpmRoot = fs.realpathSync(execSync("npm root -g", { encoding: "utf-8", timeout: 5000, windowsHide: true }).trim());
 		return cachedGlobalNpmRoot;
 	} catch {
 		// Global npm root is optional in constrained environments.
@@ -377,19 +395,13 @@ function chooseHigherPrioritySkill(existing: CachedSkillEntry | undefined, candi
 	return candidate.order < existing.order ? candidate : existing;
 }
 
+function parseSkillDescription(content: string): string | undefined {
+	return parseFrontmatter(content).frontmatter.description;
+}
+
 function maybeReadSkillDescription(filePath: string): string | undefined {
 	try {
-		const content = fs.readFileSync(filePath, "utf-8");
-		const normalized = content.replace(/\r\n/g, "\n");
-		if (!normalized.startsWith("---")) return undefined;
-
-		const endIndex = normalized.indexOf("\n---", 3);
-		if (endIndex === -1) return undefined;
-
-		const frontmatter = normalized.slice(3, endIndex).trim();
-		const match = frontmatter.match(/^description:\s*(.+)$/m);
-		if (!match) return undefined;
-		return match[1]?.trim().replace(/^['\"]|['\"]$/g, "");
+		return parseSkillDescription(fs.readFileSync(filePath, "utf-8"));
 	} catch {
 		// Description parsing is best-effort metadata extraction.
 		return undefined;
@@ -406,15 +418,17 @@ function collectFilesystemSkills(cwd: string, agentDir: string, skillPaths: Skil
 		const resolvedFile = path.resolve(filePath);
 		if (!fs.existsSync(resolvedFile)) return;
 		const source = inferSkillSource(resolvedFile, cwd, agentDir, sourceHint);
+		const description = maybeReadSkillDescription(resolvedFile);
 		const existingIndex = seen.get(resolvedFile);
 		if (existingIndex !== undefined) {
 			const existing = entries[existingIndex];
 			if (existing && (SOURCE_PRIORITY[source] ?? 0) > (SOURCE_PRIORITY[existing.source] ?? 0)) {
+				const { description: _description, ...existingWithoutDescription } = existing;
 				entries[existingIndex] = {
-					...existing,
+					...existingWithoutDescription,
 					name,
 					source,
-					description: maybeReadSkillDescription(resolvedFile),
+					...(description !== undefined ? { description } : {}),
 				};
 			}
 			return;
@@ -424,7 +438,7 @@ function collectFilesystemSkills(cwd: string, agentDir: string, skillPaths: Skil
 			name,
 			filePath: resolvedFile,
 			source,
-			description: maybeReadSkillDescription(resolvedFile),
+			...(description !== undefined ? { description } : {}),
 			order: order++,
 		});
 	};
@@ -583,12 +597,12 @@ function readSkill(
 
 		const raw = fs.readFileSync(skillPath, "utf-8");
 		const content = stripSkillFrontmatter(raw);
-		const description = maybeReadSkillDescription(skillPath);
+		const description = parseSkillDescription(raw);
 		const skill: ResolvedSkill = {
 			name: skillName,
 			path: skillPath,
 			content,
-			description,
+			...(description !== undefined ? { description } : {}),
 			source,
 		};
 
@@ -608,9 +622,22 @@ function readSkill(
 export function resolveSkills(
 	skillNames: string[],
 	cwd: string,
+	localSkillPaths?: string[],
+	localBaseDir?: string,
 ): { resolved: ResolvedSkill[]; missing: string[] } {
 	const resolved: ResolvedSkill[] = [];
 	const missing: string[] = [];
+	const localByName = new Map<string, CachedSkillEntry>();
+	if (localSkillPaths?.length) {
+		const agentDir = getAgentDir();
+		const localEntries = collectFilesystemSkills(cwd, agentDir, localSkillPaths.map((entry) => ({
+			path: path.resolve(localBaseDir ?? cwd, entry),
+			source: "unknown" as const,
+		})));
+		for (const entry of localEntries) {
+			if (!localByName.has(entry.name)) localByName.set(entry.name, entry);
+		}
+	}
 
 	for (const name of skillNames) {
 		const trimmed = name.trim();
@@ -620,18 +647,14 @@ export function resolveSkills(
 			continue;
 		}
 
-		const location = resolveSkillPath(trimmed, cwd);
-		if (!location) {
-			missing.push(trimmed);
-			continue;
+		const local = localByName.get(trimmed);
+		let skill = local ? readSkill(trimmed, local.filePath, local.source) : undefined;
+		if (!skill) {
+			const location = resolveSkillPath(trimmed, cwd);
+			if (location) skill = readSkill(trimmed, location.path, location.source);
 		}
-
-		const skill = readSkill(trimmed, location.path, location.source);
-		if (skill) {
-			resolved.push(skill);
-		} else {
-			missing.push(trimmed);
-		}
+		if (skill) resolved.push(skill);
+		else missing.push(trimmed);
 	}
 
 	return { resolved, missing };
@@ -641,8 +664,10 @@ export function resolveSkillsWithFallback(
 	skillNames: string[],
 	primaryCwd: string,
 	fallbackCwd?: string,
+	localSkillPaths?: string[],
+	localBaseDir?: string,
 ): { resolved: ResolvedSkill[]; missing: string[] } {
-	const primary = resolveSkills(skillNames, primaryCwd);
+	const primary = resolveSkills(skillNames, primaryCwd, localSkillPaths, localBaseDir);
 	if (!fallbackCwd || primary.missing.length === 0) return primary;
 	if (path.resolve(primaryCwd) === path.resolve(fallbackCwd)) return primary;
 
@@ -718,7 +743,7 @@ export function discoverAvailableSkills(cwd: string): Array<{
 		.map((s) => ({
 			name: s.name,
 			source: s.source,
-			description: s.description,
+			...(s.description !== undefined ? { description: s.description } : {}),
 		}))
 		.sort((a, b) => a.name.localeCompare(b.name));
 }

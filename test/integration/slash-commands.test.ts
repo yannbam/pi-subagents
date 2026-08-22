@@ -3,8 +3,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { beforeEach, describe, it } from "node:test";
+import { visibleWidth } from "@earendil-works/pi-tui";
 
-import { ASYNC_DIR } from "../../src/shared/types.ts";
+import { registerAgent } from "../../src/api/agents.ts";
+import { clearRuntimeAgentsForPi } from "../../src/agents/runtime-agent-registry.ts";
+import { scheduledRunStorePath } from "../../src/runs/background/scheduled-runs.ts";
+import { SUBAGENT_FANOUT_CHILD_ENV } from "../../src/runs/shared/pi-args.ts";
+import { ASYNC_DIR, DIRS } from "../../src/shared/types.ts";
+import type { WatchdogReviewFunction } from "../../src/watchdog/runtime.ts";
 
 const SLASH_RESULT_TYPE = "subagent-slash-result";
 const SLASH_SUBAGENT_REQUEST_EVENT = "subagent:slash:request";
@@ -14,6 +20,15 @@ const SLASH_SUBAGENT_RESPONSE_EVENT = "subagent:slash:response";
 interface EventBus {
 	on(event: string, handler: (data: unknown) => void): () => void;
 	emit(event: string, data: unknown): void;
+}
+
+interface RuntimeSlashPi {
+	events: EventBus;
+	on(event: string, handler: (data: unknown) => void): () => void;
+	registerTool(tool: unknown): void;
+	registerCommand(name: string, spec: RegisteredSlashCommand): void;
+	registerShortcut(key: string, spec: { handler(ctx: unknown): Promise<void> }): void;
+	sendMessage(message: unknown): void;
 }
 
 type RegisteredSlashCommand = { handler(args: string, ctx: unknown): Promise<void>; getArgumentCompletions?: (prefix: string) => unknown };
@@ -28,6 +43,7 @@ interface RegisterSlashCommandsModule {
 			): void;
 			registerShortcut(key: string, spec: { handler(ctx: unknown): Promise<void> }): void;
 			sendMessage(message: unknown): void;
+			setModel?(model: unknown): Promise<boolean>;
 		},
 		state: {
 			baseCwd: string;
@@ -41,6 +57,7 @@ interface RegisterSlashCommandsModule {
 			watcherRestartTimer: ReturnType<typeof setTimeout> | null;
 			resultFileCoalescer: { schedule(file: string, delayMs?: number): boolean; clear(): void };
 		},
+		options?: { foregroundDetachShortcut?: string },
 	) => void;
 }
 
@@ -50,13 +67,19 @@ interface SlashLiveStateModule {
 	resolveSlashMessageDetails?: typeof import("../../src/slash/slash-live-state.ts").resolveSlashMessageDetails;
 }
 
+interface WatchdogRegisterModule {
+	registerMainWatchdog?: typeof import("../../src/watchdog/register-main.ts").registerMainWatchdog;
+}
+
 let registerSlashCommands: RegisterSlashCommandsModule["registerSlashCommands"];
+let registerMainWatchdog: WatchdogRegisterModule["registerMainWatchdog"];
 let clearSlashSnapshots: SlashLiveStateModule["clearSlashSnapshots"];
 let getSlashRenderableSnapshot: SlashLiveStateModule["getSlashRenderableSnapshot"];
 let resolveSlashMessageDetails: SlashLiveStateModule["resolveSlashMessageDetails"];
 let available = true;
 try {
 	({ registerSlashCommands } = await import("../../src/slash/slash-commands.ts") as RegisterSlashCommandsModule);
+	({ registerMainWatchdog } = await import("../../src/watchdog/register-main.ts") as WatchdogRegisterModule);
 	({ clearSlashSnapshots, getSlashRenderableSnapshot, resolveSlashMessageDetails } = await import("../../src/slash/slash-live-state.ts") as SlashLiveStateModule);
 } catch {
 	available = false;
@@ -87,6 +110,9 @@ function createState(cwd: string) {
 		baseCwd: cwd,
 		currentSessionId: null,
 		asyncJobs: new Map(),
+		foregroundRuns: new Map(),
+		foregroundControls: new Map(),
+		lastForegroundControlId: null,
 		cleanupTimers: new Map(),
 		lastUiContext: null,
 		poller: null,
@@ -102,13 +128,17 @@ function createState(cwd: string) {
 
 async function withIsolatedHome<T>(fn: () => Promise<T>): Promise<T> {
 	const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-slash-home-"));
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 	const previousHome = process.env.HOME;
 	const previousUserProfile = process.env.USERPROFILE;
+	process.env.PI_CODING_AGENT_DIR = path.join(home, ".pi", "agent");
 	process.env.HOME = home;
 	process.env.USERPROFILE = home;
 	try {
 		return await fn();
 	} finally {
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
 		if (previousHome === undefined) delete process.env.HOME;
 		else process.env.HOME = previousHome;
 		if (previousUserProfile === undefined) delete process.env.USERPROFILE;
@@ -124,9 +154,20 @@ function createCommandContext(
 		hasUI: boolean;
 		custom: (...args: unknown[]) => Promise<unknown>;
 		notify: (message: string, type?: string) => void;
+		confirm: (title: string, message: string) => Promise<boolean>;
+		select: (title: string, choices: string[]) => Promise<string | undefined>;
+		editor: (title: string, prefill: string) => Promise<string | undefined>;
 		setStatus: (key: string, text: string | undefined) => void;
 		setToolsExpanded: (expanded: boolean) => void;
 		sessionManager: unknown;
+		modelRegistry: {
+			refresh?: () => void;
+			getAvailable: () => Array<{ provider: string; id: string; reasoning?: boolean; thinkingLevelMap?: Record<string, string | null> }>;
+			find?: (provider: string, id: string) => unknown;
+			hasConfiguredAuth?: (model: unknown) => boolean;
+		};
+		model: { provider: string; id: string };
+		thinkingLevel: string;
 	}> = {},
 ) {
 	return {
@@ -134,12 +175,17 @@ function createCommandContext(
 		hasUI: overrides.hasUI ?? false,
 		ui: {
 			notify: overrides.notify ?? ((_message: string) => {}),
+			confirm: overrides.confirm ?? (async () => false),
+			select: overrides.select ?? (async () => undefined),
+			editor: overrides.editor ?? (async () => undefined),
 			setStatus: overrides.setStatus ?? ((_key: string, _text: string | undefined) => {}),
 			setToolsExpanded: overrides.setToolsExpanded ?? ((_expanded: boolean) => {}),
 			onTerminalInput: () => () => {},
-			custom: overrides.custom ?? (async () => undefined),
+			...(overrides.custom ? { custom: overrides.custom } : {}),
 		},
-		modelRegistry: { getAvailable: () => [] },
+		model: overrides.model,
+		thinkingLevel: overrides.thinkingLevel,
+		modelRegistry: overrides.modelRegistry ?? { getAvailable: () => [], find: () => undefined, hasConfiguredAuth: () => true },
 		sessionManager: overrides.sessionManager ?? {
 			getSessionFile: () => null,
 			getSessionId: () => "session-test",
@@ -162,14 +208,32 @@ function writeProjectChain(root: string, fileName: string, content: string): voi
 	fs.writeFileSync(path.join(root, ".pi", "chains", fileName), content, "utf-8");
 }
 
+function createWatchdogHarness(review?: WatchdogReviewFunction) {
+	const commands = new Map<string, RegisteredSlashCommand>();
+	const renderers = new Map<string, (message: { content: string; details?: unknown }, options: { expanded: boolean }, theme: { fg(name: string, value: string): string; bold(value: string): string }) => { render(width: number): string[] } | undefined>();
+	const sent: unknown[] = [];
+	const pi = {
+		events: createEventBus(),
+		on() {},
+		registerCommand(name: string, spec: RegisteredSlashCommand) { commands.set(name, spec); },
+		registerShortcut() {},
+		registerMessageRenderer(type: string, renderer: (message: { content: string; details?: unknown }, options: { expanded: boolean }, theme: { fg(name: string, value: string): string; bold(value: string): string }) => { render(width: number): string[] } | undefined) {
+			renderers.set(type, renderer);
+		},
+		getThinkingLevel() { return "medium" as const; },
+		sendMessage(message: unknown) { sent.push(message); },
+	};
+	const runtime = registerMainWatchdog!(pi as never, review ? { review } : undefined);
+	return { commands, renderers, runtime, sent };
+}
+
 async function captureSlashCommandParams(
 	commandName: string,
 	args: string,
 	cwd: string,
-	setup?: () => void,
+	setup?: (pi: RuntimeSlashPi) => void,
 ): Promise<{ params: unknown; notifications: string[] }> {
 	return withIsolatedHome(async () => {
-		setup?.();
 		const commands = new Map<string, RegisteredSlashCommand>();
 		const events = createEventBus();
 		let requestedParams: unknown;
@@ -190,6 +254,8 @@ async function captureSlashCommandParams(
 
 		const pi = {
 			events,
+			on() { return () => {}; },
+			registerTool() {},
 			registerCommand(name: string, spec: RegisteredSlashCommand) {
 				commands.set(name, spec);
 			},
@@ -197,20 +263,338 @@ async function captureSlashCommandParams(
 			sendMessage(_message: unknown) {},
 		};
 
-		registerSlashCommands!(pi, createState(cwd));
-		await commands.get(commandName)!.handler(args, createCommandContext({
-			cwd,
-			notify: (message) => {
-				notifications.push(message);
-			},
-		}));
-		return { params: requestedParams, notifications };
+		try {
+			setup?.(pi);
+			registerSlashCommands!(pi, createState(cwd));
+			await commands.get(commandName)!.handler(args, createCommandContext({
+				cwd,
+				notify: (message) => {
+					notifications.push(message);
+				},
+			}));
+			return { params: requestedParams, notifications };
+		} finally {
+			clearRuntimeAgentsForPi(pi as never);
+		}
 	});
 }
+
+describe("subagents watchdog slash command", { skip: !available ? "watchdog command not importable" : undefined }, () => {
+	it("shows default-off status with runtime state, sources, and review seam", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-watchdog-status-", async (root) => {
+				const { commands, sent } = createWatchdogHarness();
+				await commands.get("subagents-watchdog")!.handler("", createCommandContext({ cwd: root }));
+
+				const content = String((sent[0] as { content?: unknown }).content ?? "");
+				assert.match(content, /Subagent watchdog/);
+				assert.match(content, /Main: off \(default off\)/);
+				assert.match(content, /Runtime: idle/);
+				assert.match(content, /Review model call: real model review/);
+				assert.match(content, /Sources:/);
+			});
+		});
+	});
+
+	it("recommends and saves a strong complementary watchdog model", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-watchdog-model-", async (root) => {
+				const gpt = { provider: "openai-codex", id: "gpt-5.5", reasoning: true };
+				const opus = { provider: "anthropic", id: "claude-opus-4-8", reasoning: true };
+				const models = [gpt, opus];
+				const modelRegistry = {
+					getAvailable: () => models,
+					find: (provider: string, id: string) => models.find((entry) => entry.provider === provider && entry.id === id),
+					hasConfiguredAuth: (model: unknown) => Boolean(model),
+				};
+				const ctx = createCommandContext({ cwd: root, model: gpt, modelRegistry });
+				const { commands, sent } = createWatchdogHarness();
+
+				await commands.get("subagents-watchdog")!.handler("recommend-model", ctx);
+				await commands.get("subagents-watchdog")!.handler("model recommended", ctx);
+
+				const recommendation = String((sent[0] as { content?: unknown }).content ?? "");
+				assert.match(recommendation, /Recommended: anthropic\/claude-opus-4-8:high/);
+				const settingsPath = path.join(process.env.HOME!, ".pi", "agent", "settings.json");
+				const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+				assert.equal(settings.subagents.watchdog.main.model, "anthropic/claude-opus-4-8");
+				assert.equal(settings.subagents.watchdog.main.thinking, "high");
+				assert.equal(settings.subagents.watchdog.enabled, undefined);
+				assert.match(String((sent[1] as { content?: unknown }).content ?? ""), /Run \/subagents-watchdog on if the watchdog is still off/);
+			});
+		});
+	});
+
+	it("supports session-scoped recommended watchdog models without writing settings", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-watchdog-session-model-", async (root) => {
+				const opus = { provider: "anthropic", id: "claude-opus-4-8", reasoning: true };
+				const gpt = { provider: "openai-codex", id: "gpt-5.5", reasoning: true };
+				const models = [opus, gpt];
+				const modelRegistry = {
+					getAvailable: () => models,
+					find: (provider: string, id: string) => models.find((entry) => entry.provider === provider && entry.id === id),
+					hasConfiguredAuth: (model: unknown) => Boolean(model),
+				};
+				const { commands, sent } = createWatchdogHarness();
+
+				await commands.get("subagents-watchdog")!.handler("session model recommended", createCommandContext({ cwd: root, model: opus, modelRegistry }));
+
+				assert.equal(fs.existsSync(path.join(process.env.HOME!, ".pi", "agent", "settings.json")), false);
+				const content = String((sent[0] as { content?: unknown }).content ?? "");
+				assert.match(content, /session model: openai-codex\/gpt-5\.5:high/);
+				assert.match(content, /Main model: openai-codex\/gpt-5\.5 \(session override\)/);
+				assert.match(content, /Main thinking: high/);
+			});
+		});
+	});
+
+	it("shows explicit watchdog model thinking accurately when no thinking is configured", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-watchdog-status-model-", async (root) => {
+				const settingsPath = path.join(process.env.HOME!, ".pi", "agent", "settings.json");
+				fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+				fs.writeFileSync(settingsPath, JSON.stringify({ subagents: { watchdog: { enabled: true, main: { model: "openai-codex/gpt-5.5" } } } }, null, 2), "utf-8");
+				const gpt = { provider: "openai-codex", id: "gpt-5.5", reasoning: true };
+				const opus = { provider: "anthropic", id: "claude-opus-4-8", reasoning: true };
+				const models = [gpt, opus];
+				const modelRegistry = {
+					getAvailable: () => models,
+					find: (provider: string, id: string) => models.find((entry) => entry.provider === provider && entry.id === id),
+					hasConfiguredAuth: (model: unknown) => Boolean(model),
+				};
+				const { commands, sent } = createWatchdogHarness();
+
+				await commands.get("subagents-watchdog")!.handler("status", createCommandContext({ cwd: root, model: gpt, modelRegistry }));
+
+				const content = String((sent[0] as { content?: unknown }).content ?? "");
+				assert.match(content, /Main model: openai-codex\/gpt-5\.5 \(configured\)/);
+				assert.match(content, /Main thinking: off \(default for explicit watchdog model\)/);
+			});
+		});
+	});
+
+	it("writes only user watchdog enabled settings and preserves existing settings", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-watchdog-toggle-", async (root) => {
+				const settingsPath = path.join(process.env.HOME!, ".pi", "agent", "settings.json");
+				const projectSettingsPath = path.join(root, ".pi", "settings.json");
+				fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+				fs.writeFileSync(settingsPath, JSON.stringify({
+					other: true,
+					subagents: {
+						agentOverrides: { scout: { model: "openai/test" } },
+						watchdog: { agentEndTimeoutMs: 1234, main: { enabled: false, model: "openai/watchdog" } },
+					},
+				}, null, 2), "utf-8");
+				fs.writeFileSync(projectSettingsPath, JSON.stringify({ subagents: { defaultModel: "anthropic/project" } }, null, 2), "utf-8");
+				const projectBefore = fs.readFileSync(projectSettingsPath, "utf-8");
+				const { commands, sent } = createWatchdogHarness();
+
+				await commands.get("subagents-watchdog")!.handler("on", createCommandContext({ cwd: root }));
+				let settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+				assert.equal(settings.other, true);
+				assert.equal(settings.subagents.agentOverrides.scout.model, "openai/test");
+				assert.equal(settings.subagents.watchdog.agentEndTimeoutMs, 1234);
+				assert.equal(settings.subagents.watchdog.enabled, true);
+				assert.equal(settings.subagents.watchdog.main.enabled, true);
+				assert.equal(settings.subagents.watchdog.main.model, "openai/watchdog");
+				assert.equal(fs.readFileSync(projectSettingsPath, "utf-8"), projectBefore);
+
+				await commands.get("subagents-watchdog")!.handler("off", createCommandContext({ cwd: root }));
+				settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+				assert.equal(settings.subagents.watchdog.enabled, false);
+				assert.equal(settings.subagents.watchdog.main.enabled, false);
+				assert.match(String((sent[0] as { content?: unknown }).content ?? ""), /saved to user settings/);
+			});
+		});
+	});
+
+	it("uses session on/off overrides without writing settings files", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-watchdog-session-", async (root) => {
+				const settingsPath = path.join(process.env.HOME!, ".pi", "agent", "settings.json");
+				const projectSettingsPath = path.join(root, ".pi", "settings.json");
+				const { commands, sent } = createWatchdogHarness();
+
+				await commands.get("subagents-watchdog")!.handler("session on", createCommandContext({ cwd: root }));
+				await commands.get("subagents-watchdog")!.handler("session off", createCommandContext({ cwd: root }));
+
+				assert.equal(fs.existsSync(settingsPath), false);
+				assert.equal(fs.existsSync(projectSettingsPath), false);
+				assert.match(String((sent[0] as { content?: unknown }).content ?? ""), /session override: on/i);
+				assert.match(String((sent[1] as { content?: unknown }).content ?? ""), /session override: off/i);
+			});
+		});
+	});
+
+	it("sends deterministic concern and blocker warning messages through the renderer path", async () => {
+		await withIsolatedHome(async () => {
+			const { commands, renderers, sent } = createWatchdogHarness();
+			await commands.get("subagents-watchdog")!.handler("test concern check the concern", createCommandContext());
+			await commands.get("subagents-watchdog")!.handler("test blocker check the blocker", createCommandContext());
+
+			const concern = sent[0] as { customType?: string; content?: string; display?: boolean; details?: Record<string, unknown> };
+			const blocker = sent[1] as { customType?: string; content?: string; display?: boolean; details?: Record<string, unknown> };
+			assert.equal(concern.customType, "subagent_watchdog_warning");
+			assert.equal(concern.display, true);
+			assert.equal(concern.details?.severity, "concern");
+			assert.equal(concern.details?.source, "main");
+			assert.equal(concern.details?.state, "displayed");
+			assert.match(concern.content ?? "", /source="main"/);
+			assert.match(concern.content ?? "", /<state>displayed<\/state>/);
+			assert.match(concern.content ?? "", /<recommended_action>/);
+			assert.equal(blocker.details?.severity, "blocker");
+			assert.match(blocker.content ?? "", /<blocker_guidance>/);
+
+			const renderer = renderers.get("subagent_watchdog_warning")!;
+			const rendered = renderer(blocker as never, { expanded: true }, { fg: (_name, value) => value, bold: (value) => value })!.render(100).join("\n");
+			assert.match(rendered, /Subagent watchdog Blocker \(displayed\): check the blocker/);
+			assert.match(rendered, /Manual \/subagents-watchdog test blocker message/);
+		});
+	});
+
+	it("sends accepted review warnings as visible custom watchdog messages", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-watchdog-review-warning-", async (root) => {
+				const review: WatchdogReviewFunction = (request) => {
+					assert.equal(request.emitWarning({
+						severity: "concern",
+						category: "test-gap",
+						confidence: "high",
+						source: "main",
+						summary: "Focused validation is missing",
+						evidence: "The reviewed turn delta says changes were made but contains no test command.",
+						recommendedAction: "Run the focused watchdog tests before accepting the turn.",
+					}), true);
+					return { stopReason: "stop" };
+				};
+				const { runtime, sent } = createWatchdogHarness(review);
+
+				runtime.setSessionEnabled(true, root);
+				runtime.handleBeforeAgentStart({ prompt: "Patch watchdog runtime." }, { cwd: root });
+				runtime.handleTurnEnd({
+					type: "turn_end",
+					message: { role: "assistant", content: "Changed watchdog runtime without running tests." },
+					toolResults: [{ role: "toolResult", toolName: "edit", content: "Edited src/watchdog/runtime.ts", isError: false }],
+				}, { cwd: root });
+				await runtime.handleAgentEnd({ type: "agent_end", messages: [] }, { cwd: root });
+
+				const message = sent[0] as { customType?: string; content?: string; display?: boolean; details?: Record<string, unknown> };
+				assert.equal(message.customType, "subagent_watchdog_warning");
+				assert.equal(message.display, true);
+				assert.equal(message.details?.state, "displayed");
+				assert.equal(message.details?.summary, "Focused validation is missing");
+				assert.match(message.content ?? "", /<subagent_watchdog/);
+				assert.match(message.content ?? "", /<recommended_action>/);
+			});
+		});
+	});
+});
 
 describe("slash command custom message delivery", { skip: !available ? "slash-commands.ts not importable" : undefined }, () => {
 	beforeEach(() => {
 		clearSlashSnapshots?.();
+	});
+
+	it("registers a configured foreground detach shortcut", async () => {
+		const shortcuts = new Map<string, { handler(ctx: unknown): Promise<void> }>();
+		const sent: unknown[] = [];
+		const state = createState(process.cwd());
+		let detachCalls = 0;
+		state.foregroundControls.set("run-123", {
+			runId: "run-123",
+			mode: "single",
+			updatedAt: Date.now(),
+			detach: () => {
+				detachCalls += 1;
+				return true;
+			},
+		});
+		state.lastForegroundControlId = "run-123";
+
+		registerSlashCommands!({
+			events: createEventBus(),
+			registerCommand() {},
+			registerShortcut(key: string, spec: { handler(ctx: unknown): Promise<void> }) {
+				shortcuts.set(key, spec);
+			},
+			sendMessage(message: unknown) { sent.push(message); },
+		}, state, { foregroundDetachShortcut: "ctrl+b" });
+
+		assert.ok(shortcuts.has("ctrl+b"));
+		await shortcuts.get("ctrl+b")!.handler(createCommandContext());
+		assert.equal(detachCalls, 1);
+		assert.match(String((sent[0] as { content?: unknown }).content ?? ""), /Detached foreground run run-123/);
+	});
+
+	it("does not reserve a foreground detach shortcut by default", () => {
+		const shortcuts = new Map<string, unknown>();
+		registerSlashCommands!({
+			events: createEventBus(),
+			registerCommand() {},
+			registerShortcut(key: string, spec: unknown) { shortcuts.set(key, spec); },
+			sendMessage() {},
+		}, createState(process.cwd()));
+		assert.equal(shortcuts.has("ctrl+b"), false);
+	});
+
+	it("/subagents-stop keeps the selector within its allocated width", async () => {
+		await withTempProject("pi-stop-selector-width-", async (root) => {
+			const id = "scheduled-width-check";
+			const nextRunAt = "2099-01-01T00:00:00.000Z";
+			const scheduleDir = path.join(scheduledRunStorePath(root), id);
+			fs.mkdirSync(scheduleDir, { recursive: true });
+			fs.writeFileSync(path.join(scheduleDir, "schedule.json"), JSON.stringify({
+				schemaVersion: 1,
+				id,
+				name: "A very long scheduled run name with wide characters 中文🙂",
+				cwd: root,
+				trigger: { kind: "once", at: nextRunAt, nextRunAt },
+				target: { agent: "scout", task: "Inspect" },
+				overlap: "skip",
+				catchUp: "latest",
+				paused: false,
+				createdAt: "2026-08-06T00:00:00.000Z",
+				updatedAt: "2026-08-06T00:00:00.000Z",
+			}), "utf-8");
+
+			const commands = new Map<string, RegisteredSlashCommand>();
+			const pi = {
+				events: createEventBus(),
+				registerCommand(name: string, spec: RegisteredSlashCommand) { commands.set(name, spec); },
+				registerShortcut() {},
+				sendMessage() {},
+			};
+			const rendered = new Map<number, string[]>();
+			registerSlashCommands!(pi as never, createState(root));
+			await commands.get("subagents-stop")!.handler("", createCommandContext({
+				cwd: root,
+				hasUI: true,
+				custom: async (factory) => {
+					const component = (factory as (
+						tui: { requestRender(): void },
+						theme: { fg(name: string, text: string): string; bold(text: string): string },
+						keybindings: unknown,
+						done: (result: unknown) => void,
+					) => { render(width: number): string[] })(
+						{ requestRender() {} },
+						{ fg: (_name, text) => text, bold: (text) => text },
+						{},
+						() => {},
+					);
+					for (const width of [0, 1, 2, 3, 32]) rendered.set(width, component.render(width));
+					return undefined;
+				},
+			}));
+
+			for (const [width, lines] of rendered) {
+				assert.ok(lines.length > 0);
+				for (const line of lines) {
+					assert.ok(visibleWidth(line) <= width, `stop selector line exceeds render width: ${visibleWidth(line)} > ${width}`);
+				}
+			}
+		});
 	});
 
 	it("/run accepts an agent without a task", async () => {
@@ -256,8 +640,9 @@ describe("slash command custom message delivery", { skip: !available ? "slash-co
 		const ctx = createCommandContext({ sessionManager });
 		registerSlashCommands!(pi, createState(process.cwd()));
 		await commands.get("run")!.handler("scout", ctx);
+		await new Promise<void>((resolve) => setImmediate(resolve));
 
-		assert.deepEqual(requestedParams, { agent: "scout", task: "", clarify: false, agentScope: "both" });
+		assert.deepEqual(requestedParams, { workflowScript: "return runs.run(\"run\", {\"agent\":\"scout\",\"task\":\"\",\"agentScope\":\"both\"})", async: false });
 		assert.equal(requestedCtx, ctx);
 		assert.equal(sent.length, 2);
 		assert.equal((sent[0] as { display?: boolean }).display, true);
@@ -266,6 +651,72 @@ describe("slash command custom message delivery", { skip: !available ? "slash-co
 		assert.match((sent[1] as { content?: string }).content ?? "", /Commit finished/);
 		assert.equal(sessionManager.rewrites, 2);
 		assert.equal(sessionManager.flushed, true);
+	});
+
+	it("/run reports malformed agent configuration", async () => {
+		await withTempProject("pi-slash-invalid-agent-", async (root) => {
+			fs.writeFileSync(path.join(root, ".pi", "agents", "broken.md"), "---\nname: broken\ndescription: Broken\nrunner:\n  type: unknown\n---\nBroken agent.\n");
+
+			const run = await captureSlashCommandParams("run", "broken", root);
+			assert.equal(run.params, undefined);
+			assert.match(run.notifications[0] ?? "", /Agent 'broken' has invalid configuration: Agent 'broken' has invalid runner\.type/);
+		});
+	});
+
+	it("/run blocks a malformed project agent from falling back to builtin", async () => {
+		await withTempProject("pi-slash-invalid-agent-shadow-", async (root) => {
+			fs.writeFileSync(path.join(root, ".pi", "agents", "reviewer.md"), "---\nname: reviewer\ndescription: Broken reviewer\nrunner:\n  type: unknown\n---\nBroken agent.\n");
+
+			const run = await captureSlashCommandParams("run", "reviewer", root);
+			assert.equal(run.params, undefined);
+			assert.match(run.notifications[0] ?? "", /Agent 'reviewer' has invalid configuration: Agent 'reviewer' has invalid runner\.type/);
+		});
+	});
+
+	it("/run reports malformed packaged agent configuration by runtime name", async () => {
+		await withTempProject("pi-slash-invalid-packaged-agent-", async (root) => {
+			fs.writeFileSync(path.join(root, ".pi", "agents", "code-analysis.zeta-worker.md"), "---\nname: zeta-worker\npackage: code-analysis\ndescription: Broken packaged worker\nrunner:\n  type: unknown\n---\nBroken agent.\n");
+
+			const run = await captureSlashCommandParams("run", "code-analysis.zeta-worker", root);
+			assert.equal(run.params, undefined);
+			assert.match(run.notifications[0] ?? "", /Agent 'code-analysis\.zeta-worker' has invalid configuration: Agent 'zeta-worker' has invalid runner\.type/);
+		});
+	});
+
+	it("/run accepts runtime-registered agents", async () => {
+		await withTempProject("pi-slash-runtime-agent-", async (root) => {
+			const run = await captureSlashCommandParams("run", "runtime-helper Inspect", root, (pi) => {
+				registerAgent({
+					pi: pi as never,
+					name: "runtime-helper",
+					definition: { description: "Runtime helper", systemPrompt: "Help at runtime." },
+				});
+			});
+
+			assert.deepEqual(run.params, {
+				workflowScript: "return runs.run(\"run\", {\"agent\":\"runtime-helper\",\"task\":\"Inspect\",\"agentScope\":\"both\"})",
+				async: false,
+			});
+		});
+	});
+
+	it("/run preserves existing relative reads and omits missing reads", async () => {
+		await withTempProject("pi-slash-reads-", async (root) => {
+			fs.writeFileSync(path.join(root, ".pi", "agents", "scout.md"), `---
+name: scout
+description: Scout
+---
+
+Inspect
+`, "utf-8");
+			fs.writeFileSync(path.join(root, "context.md"), "context");
+
+			const run = await captureSlashCommandParams("run", "scout[reads=context.md+missing.md] Inspect", root);
+			assert.deepEqual(run.params, {
+				workflowScript: "return runs.run(\"run\", {\"agent\":\"scout\",\"task\":\"[Read from: context.md]\\n\\nInspect\",\"agentScope\":\"both\"})",
+				async: false,
+			});
+		});
 	});
 
 	it("/run finalizes the slash snapshot before the last UI redraw on success", async () => {
@@ -305,6 +756,7 @@ describe("slash command custom message delivery", { skip: !available ? "slash-co
 				log.push(`status:${text ?? "clear"}`);
 			},
 		}));
+		await new Promise<void>((resolve) => setImmediate(resolve));
 
 		assert.equal(sent.length, 2);
 		assert.equal((sent[0] as { customType?: string; display?: boolean }).customType, SLASH_RESULT_TYPE);
@@ -394,6 +846,7 @@ describe("slash command custom message delivery", { skip: !available ? "slash-co
 				log.push(`status:${text ?? "clear"}`);
 			},
 		}));
+		await new Promise<void>((resolve) => setImmediate(resolve));
 
 		assert.equal(sent.length, 2);
 		assert.equal((sent[0] as { customType?: string; display?: boolean }).customType, SLASH_RESULT_TYPE);
@@ -410,89 +863,7 @@ describe("slash command custom message delivery", { skip: !available ? "slash-co
 		assert.equal((visibleSnapshot.result.content[0] as { text?: string }).text, "Subagent failed");
 	});
 
-	it("/parallel forwards inline output behavior config", async () => {
-		const commands = new Map<string, { handler(args: string, ctx: unknown): Promise<void> }>();
-		const events = createEventBus();
-		let requestedParams: unknown;
-		events.on(SLASH_SUBAGENT_REQUEST_EVENT, (data) => {
-			const payload = data as { requestId: string; params?: unknown };
-			requestedParams = payload.params;
-			events.emit(SLASH_SUBAGENT_STARTED_EVENT, { requestId: payload.requestId });
-			events.emit(SLASH_SUBAGENT_RESPONSE_EVENT, {
-				requestId: payload.requestId,
-				result: {
-					content: [{ type: "text", text: "parallel finished" }],
-					details: { mode: "parallel", results: [] },
-				},
-				isError: false,
-			});
-		});
-
-		const pi = {
-			events,
-			registerCommand(name: string, spec: { handler(args: string, ctx: unknown): Promise<void> }) {
-				commands.set(name, spec);
-			},
-			registerShortcut() {},
-			sendMessage(_message: unknown) {},
-		};
-
-		registerSlashCommands!(pi, createState(process.cwd()));
-		await commands.get("parallel")!.handler("scout[output=x.md,outputMode=file-only,reads=a.md+b.md,progress] -- Review", createCommandContext());
-
-		assert.deepEqual(requestedParams, {
-			tasks: [{ agent: "scout", task: "Review", output: "x.md", outputMode: "file-only", reads: ["a.md", "b.md"], progress: true }],
-			clarify: false,
-			agentScope: "both",
-		});
-	});
-
-	it("/parallel no longer hard-blocks runs above the old 8-task limit before the executor responds", async () => {
-		const sent: unknown[] = [];
-		const commands = new Map<string, { handler(args: string, ctx: unknown): Promise<void> }>();
-		const events = createEventBus();
-		let requestedTasks = 0;
-		events.on(SLASH_SUBAGENT_REQUEST_EVENT, (data) => {
-			const payload = data as { requestId: string; params?: { tasks?: unknown[] } };
-			requestedTasks = payload.params?.tasks?.length ?? 0;
-			events.emit(SLASH_SUBAGENT_STARTED_EVENT, { requestId: payload.requestId });
-			events.emit(SLASH_SUBAGENT_RESPONSE_EVENT, {
-				requestId: payload.requestId,
-				result: {
-					content: [{ type: "text", text: "parallel finished" }],
-					details: { mode: "parallel", results: [] },
-				},
-				isError: false,
-			});
-		});
-
-		const pi = {
-			events,
-			registerCommand(name: string, spec: { handler(args: string, ctx: unknown): Promise<void> }) {
-				commands.set(name, spec);
-			},
-			registerShortcut() {},
-			sendMessage(message: unknown) {
-				sent.push(message);
-			},
-		};
-
-		registerSlashCommands!(pi, createState(process.cwd()));
-		const args = Array.from({ length: 9 }, (_, index) => `scout \"task ${index + 1}\"`).join(" -> ");
-		await commands.get("parallel")!.handler(args, createCommandContext());
-
-		assert.equal(requestedTasks, 9);
-		assert.equal(sent.length, 2);
-		assert.match((sent[1] as { content?: string }).content ?? "", /parallel finished/);
-	});
-});
-
-describe("saved chain slash command", { skip: !available ? "slash-commands.ts not importable" : undefined }, () => {
-	beforeEach(() => {
-		clearSlashSnapshots?.();
-	});
-
-	it("/run and /chain accept dotted packaged runtime agent names", async () => {
+	it("/run accepts dotted packaged runtime agent names", async () => {
 		await withTempProject("pi-packaged-agent-slash-", async (root) => {
 			fs.writeFileSync(path.join(root, ".pi", "agents", "code-analysis.scout.md"), `---
 name: scout
@@ -502,392 +873,177 @@ description: Fast recon
 
 Inspect
 `, "utf-8");
-			fs.writeFileSync(path.join(root, ".pi", "agents", "documentation.writer.md"), `---
-name: writer
-package: documentation
-description: Writer
----
-
-Write
-`, "utf-8");
 
 			const run = await captureSlashCommandParams("run", "code-analysis.scout Investigate", root);
-			assert.deepEqual(run.params, { agent: "code-analysis.scout", task: "Investigate", clarify: false, agentScope: "both" });
-
-			const chain = await captureSlashCommandParams("chain", "code-analysis.scout \"Scan\" -> documentation.writer", root);
-			assert.deepEqual((chain.params as { chain?: Array<{ agent?: string; task?: string }> }).chain?.map(({ agent, task }) => ({ agent, task })), [
-				{ agent: "code-analysis.scout", task: "Scan" },
-				{ agent: "documentation.writer", task: undefined },
-			]);
+			assert.deepEqual(run.params, { workflowScript: "return runs.run(\"run\", {\"agent\":\"code-analysis.scout\",\"task\":\"Investigate\",\"agentScope\":\"both\"})", async: false });
 
 			await withIsolatedHome(async () => {
 				const commands = new Map<string, RegisteredSlashCommand>();
-				const pi = {
+				registerSlashCommands!({
 					events: createEventBus(),
 					registerCommand(name: string, spec: RegisteredSlashCommand) { commands.set(name, spec); },
 					registerShortcut() {},
-					sendMessage(_message: unknown) {},
-				};
-				registerSlashCommands!(pi, createState(root));
-				const runCompletions = commands.get("run")!.getArgumentCompletions!("code-") as Array<{ value: string; label: string }>;
-				assert.deepEqual(runCompletions.map((completion) => completion.value), ["code-analysis.scout"]);
-				const chainCompletions = commands.get("chain")!.getArgumentCompletions!("code-analysis.scout \"Scan\" -> doc") as Array<{ value: string; label: string }>;
-				assert.deepEqual(chainCompletions.map((completion) => completion.value), ["code-analysis.scout \"Scan\" -> documentation.writer"]);
+					sendMessage() {},
+				} as never, createState(root));
+				const completions = commands.get("run")!.getArgumentCompletions!("code-") as Array<{ value: string }>;
+				assert.deepEqual(completions.map(({ value }) => value), ["code-analysis.scout"]);
 			});
 		});
 	});
 
-	it("/run-chain launches a saved chain with a shared task", async () => {
-		await withTempProject("pi-run-chain-success-", async (root) => {
-			writeProjectChain(root, "review-flow.chain.md", `---
-name: review-flow
-description: Review flow
+	it("/run reports malformed packaged local-name fallback configuration", async () => {
+		await withTempProject("pi-packaged-agent-local-slash-", async (root) => {
+			const highPackage = path.join(root, "high-package");
+			const lowPackage = path.join(root, "low-package");
+			for (const packageRoot of [highPackage, lowPackage]) {
+				fs.mkdirSync(path.join(packageRoot, "agents"), { recursive: true });
+				fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ "pi-subagents": { agents: ["agents"] } }));
+			}
+			fs.writeFileSync(path.join(highPackage, "agents", "foo.md"), `---
+name: foo
+package: acme
+description: Broken high package foo
+runner:
+  type: unknown
 ---
-
-## scout
-
-Scan {task}
-
-## reviewer
-
-Review {previous}
-`);
-
-			const { params } = await captureSlashCommandParams("run-chain", "review-flow -- Audit the auth flow", root);
-			const runParams = params as {
-				chain?: Array<{ agent?: string; task?: string }>;
-				task?: string;
-				clarify?: boolean;
-				agentScope?: string;
-				async?: unknown;
-				context?: unknown;
-			};
-
-			assert.deepEqual(runParams.chain?.map(({ agent, task }) => ({ agent, task })), [
-				{ agent: "scout", task: "Scan {task}" },
-				{ agent: "reviewer", task: "Review {previous}" },
-			]);
-			assert.equal(runParams.task, "Audit the auth flow");
-			assert.equal(runParams.clarify, false);
-			assert.equal(runParams.agentScope, "both");
-			assert.equal(runParams.async, undefined);
-			assert.equal(runParams.context, undefined);
-		});
-	});
-
-	it("/run-chain launches a saved JSON chain with dynamic fanout", async () => {
-		await withTempProject("pi-run-chain-json-dynamic-", async (root) => {
-			writeProjectChain(root, "dynamic-review.chain.json", JSON.stringify({
-				name: "dynamic-review",
-				description: "Dynamic review flow",
-				chain: [
-					{ agent: "scout", task: "Return targets", as: "targets", outputSchema: { type: "object" } },
-					{
-						expand: { from: { output: "targets", path: "/items" }, item: "target", key: "/path", maxItems: 4 },
-						parallel: { agent: "reviewer", task: "Review {target.path}", outputSchema: { type: "object" } },
-						collect: { as: "reviews" },
-					},
-				],
-			}));
-
-			const { params } = await captureSlashCommandParams("run-chain", "dynamic-review -- Audit", root);
-			const runParams = params as { chain?: Array<Record<string, unknown>>; task?: string; clarify?: boolean; agentScope?: string };
-
-			assert.equal(runParams.task, "Audit");
-			assert.equal(runParams.clarify, false);
-			assert.equal(runParams.agentScope, "both");
-			assert.equal(runParams.chain?.[0]?.agent, "scout");
-			assert.deepEqual(runParams.chain?.[1]?.expand, { from: { output: "targets", path: "/items" }, item: "target", key: "/path", maxItems: 4 });
-			assert.deepEqual(runParams.chain?.[1]?.collect, { as: "reviews" });
-		});
-	});
-
-	it("/run-chain launches and completes packaged saved chains by dotted runtime name", async () => {
-		await withTempProject("pi-run-chain-packaged-", async (root) => {
-			writeProjectChain(root, "code-analysis.review-flow.chain.md", `---
-name: review-flow
-package: code-analysis
-description: Review flow
----
-
-## code-analysis.scout
-
-Scan {task}
-`);
-
-			const { params } = await captureSlashCommandParams("run-chain", "code-analysis.review-flow -- Audit", root);
-			assert.equal((params as { task?: string }).task, "Audit");
-			assert.deepEqual((params as { chain?: Array<{ agent?: string; task?: string }> }).chain?.map(({ agent, task }) => ({ agent, task })), [
-				{ agent: "code-analysis.scout", task: "Scan {task}" },
-			]);
-
-			await withIsolatedHome(async () => {
-				const commands = new Map<string, RegisteredSlashCommand>();
-				const pi = {
-					events: createEventBus(),
-					registerCommand(name: string, spec: RegisteredSlashCommand) { commands.set(name, spec); },
-					registerShortcut() {},
-					sendMessage(_message: unknown) {},
-				};
-				registerSlashCommands!(pi, createState(root));
-				const completions = commands.get("run-chain")!.getArgumentCompletions!("code-") as Array<{ value: string; label: string }>;
-				assert.deepEqual(completions.map((completion) => completion.value), ["code-analysis.review-flow"]);
-			});
-		});
-	});
-
-	it("/run-chain reports an unknown saved chain without launching", async () => {
-		await withTempProject("pi-run-chain-unknown-", async (root) => {
-			const { params, notifications } = await captureSlashCommandParams("run-chain", "missing -- Do work", root);
-
-			assert.equal(params, undefined);
-			assert.deepEqual(notifications, ["Unknown chain: missing"]);
-		});
-	});
-
-	it("/run-chain suggests saved chain names", async () => {
-		await withTempProject("pi-run-chain-completions-", async (root) => {
-			writeProjectChain(root, "review-flow.chain.md", `---
-name: review-flow
-description: Review flow
----
-
-## scout
-
-Scan
-`);
-			writeProjectChain(root, "release-flow.chain.md", `---
-name: release-flow
-description: Release flow
----
-
-## planner
-
-Plan
-`);
-			writeProjectChain(root, "triage.chain.md", `---
-name: triage
-description: Triage flow
----
-
-## scout
-
-Triage
-`);
-
-			await withIsolatedHome(async () => {
-				const commands = new Map<string, RegisteredSlashCommand>();
-				const pi = {
-					events: createEventBus(),
-					registerCommand(name: string, spec: RegisteredSlashCommand) {
-						commands.set(name, spec);
-					},
-					registerShortcut() {},
-					sendMessage(_message: unknown) {},
-				};
-
-				registerSlashCommands!(pi, createState(root));
-				const completions = commands.get("run-chain")!.getArgumentCompletions!("re") as Array<{ value: string; label: string }>;
-				assert.deepEqual(completions.map((completion) => completion.value).sort(), ["release-flow", "review-flow"]);
-				assert.deepEqual(completions.map((completion) => completion.label).sort(), ["release-flow", "review-flow"]);
-				assert.equal(commands.get("run-chain")!.getArgumentCompletions!("review-flow -- "), null);
-			});
-		});
-	});
-
-	it("/run-chain maps --bg to async execution", async () => {
-		await withTempProject("pi-run-chain-bg-", async (root) => {
-			writeProjectChain(root, "review-flow.chain.md", `---
-name: review-flow
-description: Review flow
----
-
-## scout
-
-Scan
-`);
-
-			const { params } = await captureSlashCommandParams("run-chain", "review-flow -- Audit --bg", root);
-
-			assert.equal((params as { async?: unknown }).async, true);
-			assert.equal((params as { context?: unknown }).context, undefined);
-		});
-	});
-
-	it("/run-chain maps --fork to forked context", async () => {
-		await withTempProject("pi-run-chain-fork-", async (root) => {
-			writeProjectChain(root, "review-flow.chain.md", `---
-name: review-flow
-description: Review flow
----
-
-## scout
-
-Scan
-`);
-
-			const { params } = await captureSlashCommandParams("run-chain", "review-flow -- Audit --fork", root);
-
-			assert.equal((params as { context?: unknown }).context, "fork");
-			assert.equal((params as { async?: unknown }).async, undefined);
-		});
-	});
-
-	it("/run-chain prefers a project saved chain over a same-named user chain", async () => {
-		await withTempProject("pi-run-chain-priority-", async (root) => {
-			writeProjectChain(root, "review-flow.chain.md", `---
-name: review-flow
-description: Project review flow
----
-
-## scout
-
-Project chain task
-`);
-
-			const { params } = await captureSlashCommandParams("run-chain", "review-flow -- Shared task", root, () => {
-				const userChainsDir = path.join(os.homedir(), ".pi", "agent", "chains");
-				fs.mkdirSync(userChainsDir, { recursive: true });
-				fs.writeFileSync(path.join(userChainsDir, "review-flow.chain.md"), `---
-name: review-flow
-description: User review flow
----
-
-## scout
-
-User chain task
+Broken foo.
 `, "utf-8");
-			});
+			fs.writeFileSync(path.join(lowPackage, "agents", "foo.md"), `---
+name: foo
+package: acme
+description: Valid low package foo
+---
+Valid foo.
+`, "utf-8");
+			fs.writeFileSync(path.join(root, ".pi", "settings.json"), JSON.stringify({ packages: [highPackage, lowPackage] }));
 
-			assert.equal((params as { chain?: Array<{ task?: string }> }).chain?.[0]?.task, "Project chain task");
+			const run = await captureSlashCommandParams("run", "foo Investigate", root);
+			assert.equal(run.params, undefined);
+			assert.match(run.notifications[0] ?? "", /Agent 'foo' has invalid configuration: Agent 'foo' has invalid runner\.type/);
 		});
 	});
 
-	it("/run-chain resolves saved outputSchema files at the command boundary", async () => {
-		await withTempProject("pi-run-chain-schema-", async (root) => {
-			const schemasDir = path.join(root, ".pi", "chains", "schemas");
-			fs.mkdirSync(schemasDir, { recursive: true });
-			fs.writeFileSync(path.join(schemasDir, "finding.schema.json"), JSON.stringify({ type: "object", properties: { ok: { type: "boolean" } } }), "utf-8");
-			writeProjectChain(root, "schema-flow.chain.md", `---
-name: schema-flow
-description: Schema flow
----
-
-## scout
-outputSchema: ./schemas/finding.schema.json
-
-Gather context
-`);
-
-			const { params } = await captureSlashCommandParams("run-chain", "schema-flow -- Shared task", root);
-
-			assert.deepEqual((params as { chain?: Array<{ outputSchema?: unknown }> }).chain?.[0]?.outputSchema, {
-				type: "object",
-				properties: { ok: { type: "boolean" } },
-			});
-		});
-	});
-
-	it("/run-chain preserves saved step behavior fields", async () => {
-		await withTempProject("pi-run-chain-fields-", async (root) => {
-			writeProjectChain(root, "field-flow.chain.md", `---
-name: field-flow
-description: Field flow
----
-
-## scout
-output: context.md
-outputMode: file-only
-reads: input.md, notes.md
-model: openai/gpt-5.5
-skills: research, audit
-progress: true
-
-Gather context
-`);
-
-			const { params } = await captureSlashCommandParams("run-chain", "field-flow -- Shared task", root);
-
-			assert.deepEqual((params as { chain?: unknown[] }).chain?.[0], {
-				agent: "scout",
-				task: "Gather context",
-				output: "context.md",
-				outputMode: "file-only",
-				reads: ["input.md", "notes.md"],
-				progress: true,
-				skill: ["research", "audit"],
-				model: "openai/gpt-5.5",
-			});
-		});
+	it("does not register legacy orchestration commands", async () => {
+		const commands = new Map<string, unknown>();
+		registerSlashCommands!({
+			registerCommand(name: string, command: unknown) { commands.set(name, command); },
+			registerShortcut() {},
+			events: createEventBus(),
+		} as never, { baseCwd: process.cwd() } as never);
+		assert.equal(commands.has("run"), true);
+		assert.equal(commands.has("chain"), false);
+		assert.equal(commands.has("parallel"), false);
+		assert.equal(commands.has("run-chain"), false);
 	});
 });
 
+describe("subagents-inspect-rpc command", { skip: !available ? "slash-commands.ts not importable" : undefined }, () => {
+	function writeInspectableRun(runId: string, sessionId: string) {
+		const asyncDir = path.join(ASYNC_DIR, runId);
+		fs.mkdirSync(asyncDir, { recursive: true });
+		fs.mkdirSync(DIRS.results, { recursive: true });
+		const sessionRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-inspect-itest-session-"));
+		const sessionFile = path.join(sessionRoot, "session.jsonl");
+		fs.writeFileSync(sessionFile, [
+			JSON.stringify({ message: { role: "user", content: "inspect me" } }),
+			JSON.stringify({ message: { role: "assistant", content: [{ type: "text", text: "inspected" }] } }),
+		].join("\n") + "\n", "utf-8");
+		fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+			runId,
+			sessionId,
+			mode: "single",
+			state: "complete",
+			startedAt: 100,
+			endedAt: 200,
+			lastUpdate: 200,
+			sessionFile,
+			sessionRoot,
+			steps: [{ agent: "worker", status: "complete", startedAt: 100, endedAt: 150, sessionFile }],
+		}, null, 2), "utf-8");
+		return { asyncDir, sessionRoot };
+	}
 
-describe("subagents-models slash command", { skip: !available ? "slash-commands.ts not importable" : undefined }, () => {
-	beforeEach(() => {
-		clearSlashSnapshots?.();
+	function makeInspectCtx(mode: string) {
+		const widgetCalls: Array<{ key: string; value: unknown }> = [];
+		const notifications: string[] = [];
+		const ctx = {
+			mode,
+			hasUI: true,
+			cwd: process.cwd(),
+			ui: {
+				setWidget: (key: string, value: unknown) => { widgetCalls.push({ key, value }); },
+				notify: (message: string) => { notifications.push(message); },
+				setStatus: () => {},
+				setToolsExpanded: () => {},
+			},
+			sessionManager: { getSessionFile: () => null, getSessionId: () => "session-itest" },
+		};
+		return { ctx, widgetCalls, notifications };
+	}
+
+	function registerWithState(sessionId: string | null, trustedSessionRoots: string[] = []) {
+		const commands = new Map<string, RegisteredSlashCommand>();
+		const pi = {
+			events: createEventBus(),
+			registerCommand(name: string, spec: RegisteredSlashCommand) { commands.set(name, spec); },
+			registerShortcut() {},
+			sendMessage() {},
+		};
+		const state = { ...createState(process.cwd()), currentSessionId: sessionId, trustedSessionRoots };
+		registerSlashCommands!(pi as never, state as never);
+		return commands;
+	}
+
+	it("emits a correlated payload widget then retracts it on RPC surfaces", async () => {
+		writeInspectableRun("run-itest", "session-itest");
+		const commands = registerWithState("session-itest");
+		const { ctx, widgetCalls, notifications } = makeInspectCtx("rpc");
+		await commands.get("subagents-inspect-rpc")!.handler("req-itest run-itest", ctx);
+
+		assert.deepEqual(widgetCalls.map((call) => call.key), ["subagent-inspect", "subagent-inspect"]);
+		const [set, clear] = widgetCalls;
+		assert.equal(clear!.value, undefined);
+		const lines = set!.value as string[];
+		assert.equal(lines.length, 1);
+		assert.ok(lines[0]!.startsWith("PI_SUBAGENT_INSPECT_JSON:"));
+		const reply = JSON.parse(lines[0]!.slice("PI_SUBAGENT_INSPECT_JSON:".length));
+		assert.equal(reply.kind, "pi-subagents.inspect-reply");
+		assert.equal(reply.version, 1);
+		assert.equal(reply.requestId, "req-itest");
+		assert.equal(reply.status, "complete");
+		assert.equal(reply.task, "inspect me");
+		assert.equal(reply.error, undefined);
+		assert.equal(JSON.stringify(reply).includes("session.jsonl"), false);
+		assert.equal(notifications.length, 0);
 	});
 
-	it("routes to the models tool action", async () => {
-		const { params } = await captureSlashCommandParams("subagents-models", "", process.cwd());
-		assert.deepEqual(params, { action: "models" });
+	it("answers foreign_session for runs owned by another session", async () => {
+		writeInspectableRun("run-itest-foreign", "session-other");
+		const commands = registerWithState("session-itest");
+		const { ctx, widgetCalls } = makeInspectCtx("rpc");
+		await commands.get("subagents-inspect-rpc")!.handler("req-foreign run-itest-foreign", ctx);
+		const lines = widgetCalls[0]!.value as string[];
+		const reply = JSON.parse(lines[0]!.slice("PI_SUBAGENT_INSPECT_JSON:".length));
+		assert.equal(reply.error?.code, "foreign_session");
+		assert.equal(reply.messages, undefined);
 	});
 
-	it("passes an optional builtin filter", async () => {
-		const { params } = await captureSlashCommandParams("subagents-models", "scout", process.cwd());
-		assert.deepEqual(params, { action: "models", agent: "scout" });
+	it("answers invalid_request with the echoed requestId for malformed args", async () => {
+		const commands = registerWithState("session-itest");
+		const { ctx, widgetCalls } = makeInspectCtx("rpc");
+		await commands.get("subagents-inspect-rpc")!.handler("req-bad", ctx);
+		const lines = widgetCalls[0]!.value as string[];
+		const reply = JSON.parse(lines[0]!.slice("PI_SUBAGENT_INSPECT_JSON:".length));
+		assert.equal(reply.error?.code, "invalid_request");
+		assert.equal(reply.requestId, "req-bad");
 	});
 
-	it("rejects invalid builtin filters without launching", async () => {
-		const { params, notifications } = await captureSlashCommandParams("subagents-models", "not-a-builtin", process.cwd());
-		assert.equal(params, undefined);
-		assert.deepEqual(notifications, ["Unknown builtin agent: not-a-builtin"]);
+	it("degrades to a notification in TUI mode without emitting widgets", async () => {
+		writeInspectableRun("run-itest-tui", "session-itest");
+		const commands = registerWithState("session-itest");
+		const { ctx, widgetCalls, notifications } = makeInspectCtx("tui");
+		await commands.get("subagents-inspect-rpc")!.handler("req-tui run-itest-tui", ctx);
+		assert.equal(widgetCalls.length, 0);
+		assert.match(notifications[0] ?? "", /RPC surfaces/);
 	});
-
-	it("suggests builtin agent names", async () => {
-		await withIsolatedHome(async () => {
-			const commands = new Map<string, RegisteredSlashCommand>();
-			const pi = {
-				events: createEventBus(),
-				registerCommand(name: string, spec: RegisteredSlashCommand) {
-					commands.set(name, spec);
-				},
-				registerShortcut() {},
-				sendMessage(_message: unknown) {},
-			};
-
-			registerSlashCommands!(pi, createState(process.cwd()));
-			const completions = commands.get("subagents-models")!.getArgumentCompletions!("sc") as Array<{ value: string; label: string }>;
-			assert.deepEqual(completions.map((completion) => completion.value), ["scout"]);
-		});
-	});
-});
-
-describe("subagents-doctor slash command", { skip: !available ? "slash-commands.ts not importable" : undefined }, () => {
-	beforeEach(() => {
-		clearSlashSnapshots?.();
-	});
-
-	it("routes to the doctor tool action", async () => {
-		const { params } = await captureSlashCommandParams("subagents-doctor", "", process.cwd());
-		assert.deepEqual(params, { action: "doctor" });
-	});
-
-	it("does not register the removed subagents-status overlay command", async () => {
-		await withIsolatedHome(async () => {
-			const commands = new Map<string, RegisteredSlashCommand>();
-			const pi = {
-				events: createEventBus(),
-				registerCommand(name: string, spec: RegisteredSlashCommand) {
-					commands.set(name, spec);
-				},
-				registerShortcut() {},
-				sendMessage(_message: unknown) {},
-			};
-
-			registerSlashCommands!(pi, createState(process.cwd()));
-			assert.equal(commands.has("subagents-status"), false);
-		});
-	});
-
 });

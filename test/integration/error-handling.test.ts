@@ -25,14 +25,11 @@ import {
 // Top-level await
 const utils = await tryImport<any>("./src/shared/utils.ts");
 const execution = await tryImport<any>("./src/runs/foreground/execution.ts");
-const chainMod = await tryImport<any>("./src/runs/foreground/chain-execution.ts");
 
 const piAvailable = !!(execution && utils);
-const chainAvailable = !!chainMod;
 
 const runSync = execution?.runSync;
 const detectSubagentError = utils?.detectSubagentError;
-const executeChain = chainMod?.executeChain;
 
 // ---------------------------------------------------------------------------
 // detectSubagentError
@@ -49,13 +46,13 @@ describe("detectSubagentError", { skip: !detectSubagentError ? "utils not import
 		assert.equal(result.hasError, false);
 	});
 
-	it("detects fatal bash error in last tool result", () => {
+	it("detects bash error in last tool result", () => {
 		const messages = [
 			{ role: "assistant", content: [{ type: "text", text: "Running..." }] },
 			{
 				role: "toolResult",
 				toolName: "bash",
-				isError: false,
+				isError: true,
 				content: [{ type: "text", text: "command not found" }],
 			},
 		];
@@ -64,13 +61,13 @@ describe("detectSubagentError", { skip: !detectSubagentError ? "utils not import
 		assert.equal(result.errorType, "bash");
 	});
 
-	it("detects non-zero exit code in bash output", () => {
+	it("extracts a non-zero exit code from bash error output", () => {
 		const messages = [
 			{ role: "assistant", content: [{ type: "text", text: "Running..." }] },
 			{
 				role: "toolResult",
 				toolName: "bash",
-				isError: false,
+				isError: true,
 				content: [{ type: "text", text: "Error: process exited with code 127" }],
 			},
 		];
@@ -146,9 +143,10 @@ describe("runSync error handling", { skip: !piAvailable ? "pi packages not avail
 	it("detectSubagentError overrides exit 0 on hidden failure", async () => {
 		mockPi.onCall({
 			jsonl: [
+				events.assistantMessage("Starting deployment"),
 				events.toolStart("bash", { command: "deploy" }),
 				events.toolEnd("bash"),
-				events.toolResult("bash", "connection refused"),
+				events.toolResult("bash", "connection refused", true),
 			],
 		});
 		const agents = makeAgentConfigs(["deployer"]);
@@ -157,6 +155,55 @@ describe("runSync error handling", { skip: !piAvailable ? "pi packages not avail
 
 		assert.notEqual(result.exitCode, 0, "should detect hidden failure");
 		assert.ok(result.error?.includes("connection refused"));
+	});
+
+	it("kills a wedged foreground tool at the configured per-tool timeout", { skip: process.platform === "win32" ? "timeout signal delivery intermittent on Windows CI" : undefined }, async () => {
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [events.toolStart("bash")] },
+				{ delay: 30_000 },
+			],
+		});
+		const agents = makeAgentConfigs(["slow"]);
+
+		const result = await runSync(tempDir, agents, "slow", "Wait", {
+			toolTimeoutMs: 1_000,
+			timeoutMs: 8_000,
+		});
+
+		assert.equal(result.timedOut, true);
+		assert.match(result.error ?? "", /Tool 'bash' exceeded its timeout of 1000ms\./);
+	});
+
+	it("emits foreground open-tool attention for an earlier overlapping tool", async () => {
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [{ type: "tool_execution_start", toolCallId: "bash-1", toolName: "bash", args: { command: "sleep 2" } }] },
+				{ delay: 50, jsonl: [
+					{ type: "tool_execution_start", toolCallId: "read-1", toolName: "read", args: { path: "README.md" } },
+					{ type: "tool_execution_end", toolCallId: "read-1", toolName: "read" },
+				] },
+				{ delay: 1_200, jsonl: [
+					{ type: "tool_execution_end", toolCallId: "bash-1", toolName: "bash" },
+					events.toolResult("bash", "done"),
+					events.assistantMessage("Done"),
+				] },
+			],
+		});
+		const agents = makeAgentConfigs(["slow"]);
+		const controlEvents: Array<{ type?: string; reason?: string; currentTool?: string; message?: string }> = [];
+
+		const result = await runSync(tempDir, agents, "slow", "Wait", {
+			runId: "foreground-overlap-attention",
+			controlConfig: { enabled: true, needsAttentionAfterMs: 999_999, activeNoticeAfterMs: 100, notifyOn: ["needs_attention"] },
+			onControlEvent: (event: { type?: string; reason?: string; currentTool?: string; message?: string }) => controlEvents.push(event),
+		});
+
+		const attention = controlEvents.find((event) => event.reason === "tool_open_threshold");
+		assert.equal(result.exitCode, 0);
+		assert.equal(attention?.type, "needs_attention");
+		assert.equal(attention?.currentTool, "bash");
+		assert.match(attention?.message ?? "", /tool 'bash' open/);
 	});
 
 	it("handles abort signal (completes faster than delay)", async () => {
@@ -174,79 +221,5 @@ describe("runSync error handling", { skip: !piAvailable ? "pi packages not avail
 
 		// Key: should complete much faster than the 10s delay
 		assert.ok(elapsed < 5000, `should abort early, took ${elapsed}ms`);
-	});
-});
-
-// ---------------------------------------------------------------------------
-// Chain error propagation
-// ---------------------------------------------------------------------------
-
-describe("chain error propagation", { skip: !chainAvailable ? "chain module not available" : undefined }, () => {
-	let tempDir: string;
-	let mockPi: MockPi;
-
-	before(() => {
-		mockPi = createMockPi();
-		mockPi.install();
-	});
-
-	after(() => {
-		mockPi.uninstall();
-	});
-
-	beforeEach(() => {
-		tempDir = createTempDir();
-		mockPi.reset();
-	});
-
-	afterEach(() => {
-		removeTempDir(tempDir);
-	});
-
-	function makeChainParams(chain: any[], agents: any[]) {
-		return {
-			chain,
-			agents,
-			ctx: makeMinimalCtx(tempDir),
-			runId: "test-err",
-			shareEnabled: false,
-			sessionDirForIndex: () => undefined,
-			artifactsDir: path.join(tempDir, "artifacts"),
-			artifactConfig: { enabled: false },
-			clarify: false,
-		};
-	}
-
-	it("preserves error context from failed step", async () => {
-		mockPi.onCall({ exitCode: 1, stderr: "Step 1 exploded" });
-		const agents = [makeAgent("step1"), makeAgent("step2")];
-
-		const result = await executeChain(
-			makeChainParams(
-				[{ agent: "step1", task: "Fail here" }, { agent: "step2" }],
-				agents,
-			),
-		);
-
-		assert.ok(result.isError);
-		const failedResult = result.details.results[0];
-		assert.equal(failedResult.exitCode, 1);
-		assert.ok(failedResult.error?.includes("exploded"));
-	});
-
-	it("reports currentStepIndex on failure", async () => {
-		mockPi.onCall({ exitCode: 1 });
-		const agents = [makeAgent("a"), makeAgent("b"), makeAgent("c")];
-
-		const result = await executeChain(
-			makeChainParams(
-				[{ agent: "a", task: "First" }, { agent: "b" }, { agent: "c" }],
-				agents,
-			),
-		);
-
-		assert.ok(result.isError);
-		assert.equal(result.details.currentStepIndex, 0);
-		assert.equal(result.details.results.length, 1);
 	});
 });

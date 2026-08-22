@@ -3,10 +3,11 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentConfig } from "../agents/agents.ts";
 import { normalizeSkillInput } from "../agents/skills.ts";
-import { CHAIN_RUNS_DIR, type AcceptanceInput, type JsonSchemaObject, type OutputMode } from "./types.ts";
+import { CHAIN_RUNS_DIR, type AcceptanceInput, type AgentContract, type ChainGateLayer, type JsonSchemaObject, type OutputMode, type ToolBudgetConfig } from "./types.ts";
 const CHAIN_DIR_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
 const INITIAL_PROGRESS_CONTENT = "# Progress\n\n## Status\nIn Progress\n\n## Tasks\n\n## Files Changed\n\n## Notes\n";
 
@@ -23,8 +24,10 @@ export interface ResolvedStepBehavior {
 	model?: string;
 }
 
+export type OutputOverrideInput = string | boolean;
+
 export interface StepOverrides {
-	output?: string | false;
+	output?: OutputOverrideInput;
 	outputMode?: OutputMode;
 	reads?: string[] | false;
 	progress?: boolean;
@@ -32,8 +35,10 @@ export interface StepOverrides {
 	model?: string;
 }
 
-function normalizeOutputOverride(output: string | false | undefined): string | false | undefined {
-	return output === "false" ? false : output;
+function normalizeOutputOverride(output: unknown): string | false | undefined {
+	if (output === false || output === "false") return false;
+	if (output === true || output === "true") return undefined;
+	return typeof output === "string" && output.length > 0 ? output : undefined;
 }
 
 // =============================================================================
@@ -49,13 +54,18 @@ export interface SequentialStep {
 	as?: string;
 	outputSchema?: JsonSchemaObject;
 	cwd?: string;
-	output?: string | false;
+	output?: OutputOverrideInput;
 	outputMode?: OutputMode;
 	reads?: string[] | false;
 	progress?: boolean;
 	skill?: string | string[] | false;
 	model?: string;
+	toolBudget?: ToolBudgetConfig;
 	acceptance?: AcceptanceInput;
+	agentContract?: AgentContract;
+	gateOn?: ChainGateLayer;
+	/** Internal workflow child isolation; public workflowScript supplies this on runs.run. */
+	worktree?: boolean;
 }
 
 /** Parallel task item within a parallel step */
@@ -68,13 +78,16 @@ export interface ParallelTaskItem {
 	outputSchema?: JsonSchemaObject;
 	cwd?: string;
 	count?: number;
-	output?: string | false;
+	output?: OutputOverrideInput;
 	outputMode?: OutputMode;
 	reads?: string[] | false;
 	progress?: boolean;
 	skill?: string | string[] | false;
 	model?: string;
+	toolBudget?: ToolBudgetConfig;
 	acceptance?: AcceptanceInput;
+	agentContract?: AgentContract;
+	gateOn?: ChainGateLayer;
 }
 
 export interface DynamicExpandSpec {
@@ -104,6 +117,8 @@ export interface DynamicParallelStep {
 	phase?: string;
 	label?: string;
 	acceptance?: AcceptanceInput;
+	agentContract?: AgentContract;
+	gateOn?: ChainGateLayer;
 }
 
 /** Parallel step: multiple agents running concurrently */
@@ -113,6 +128,8 @@ export interface ParallelStep {
 	failFast?: boolean;
 	worktree?: boolean;
 	cwd?: string;
+	agentContract?: AgentContract;
+	gateOn?: ChainGateLayer;
 }
 
 /** Union type for chain steps */
@@ -265,7 +282,7 @@ export function resolveStepBehavior(
 		}
 	}
 
-	const outputMode = stepOverrides.outputMode ?? "inline";
+	const outputMode = stepOverrides.outputMode ?? agentConfig.outputMode ?? "inline";
 	const model = stepOverrides.model ?? agentConfig.model;
 	return { output, outputMode, reads, progress, skills, model };
 }
@@ -294,10 +311,34 @@ export function suppressProgressForReadOnlyTask(behavior: ResolvedStepBehavior, 
 // =============================================================================
 
 /**
- * Resolve a file path: absolute paths pass through, relative paths get chainDir prepended.
+ * Expand a leading `~`/`~/` to the user's home directory. Other forms (relative,
+ * absolute, `~user/`) pass through unchanged.
  */
-function resolveChainPath(filePath: string, chainDir: string): string {
-	return path.isAbsolute(filePath) ? filePath : path.join(chainDir, filePath);
+export function expandHomePath(filePath: string): string {
+	if (filePath === "~") return os.homedir();
+	if (filePath.startsWith("~/")) return path.join(os.homedir(), filePath.slice(2));
+	return filePath;
+}
+
+/**
+ * Resolve a file path: `~`/`~/` expand to home first, then absolute paths pass
+ * through and relative paths get chainDir prepended.
+ */
+export function resolveChainPath(filePath: string, chainDir: string): string {
+	const expanded = expandHomePath(filePath);
+	return path.isAbsolute(expanded) ? expanded : path.join(chainDir, expanded);
+}
+
+export function resolveExistingReadInstructionPaths(reads: readonly string[], instructionCwd: string, existenceCwd = instructionCwd): string[] {
+	return reads.flatMap((filePath) => {
+		const instructionPath = resolveChainPath(filePath, instructionCwd);
+		const existencePath = resolveChainPath(filePath, existenceCwd);
+		return fs.existsSync(existencePath) ? [instructionPath] : [];
+	});
+}
+
+export function resolveExistingReadPaths(reads: readonly string[], cwd: string): string[] {
+	return resolveExistingReadInstructionPaths(reads, cwd);
 }
 
 /**
@@ -314,14 +355,15 @@ export function buildChainInstructions(
 	chainDir: string,
 	isFirstProgressAgent: boolean,
 	previousSummary?: string,
+	readExistenceDir = chainDir,
 ): { prefix: string; suffix: string } {
 	const prefixParts: string[] = [];
 	const suffixParts: string[] = [];
 
 	// READS - prepend to override any hardcoded filenames in task text
 	if (behavior.reads && behavior.reads.length > 0) {
-		const files = behavior.reads.map((f) => resolveChainPath(f, chainDir));
-		prefixParts.push(`[Read from: ${files.join(", ")}]`);
+		const files = resolveExistingReadInstructionPaths(behavior.reads, chainDir, readExistenceDir);
+		if (files.length > 0) prefixParts.push(`[Read from: ${files.join(", ")}]`);
 	}
 
 	// OUTPUT - prepend so agent knows where to write
@@ -423,7 +465,7 @@ export function resolveParallelBehaviors(
 			}
 		}
 
-		const outputMode = task.outputMode ?? "inline";
+		const outputMode = task.outputMode ?? config.outputMode ?? "inline";
 		const model = task.model ?? config.model;
 		return { output, outputMode, reads, progress, skills, model };
 	});

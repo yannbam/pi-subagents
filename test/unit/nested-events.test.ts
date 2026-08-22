@@ -4,8 +4,10 @@ import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import type { AsyncJobState, SubagentState } from "../../src/shared/types.ts";
 import {
+	buildNestedRouteIndex,
 	createNestedRoute,
 	hasLiveNestedDescendants,
+	nestedSummaryFromAsyncStatus,
 	parseNestedEventRecords,
 	projectNestedEvents,
 	resolveNestedParentAddressFromEnv,
@@ -37,9 +39,23 @@ const savedEnv = {
 	[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV]: process.env[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV],
 };
 
-afterEach(() => {
+async function removeDirWithRetry(dir: string): Promise<void> {
+	let lastError: unknown;
+	for (let attempt = 0; attempt < 5; attempt++) {
+		try {
+			fs.rmSync(dir, { recursive: true, force: true });
+			return;
+		} catch (error) {
+			lastError = error;
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+	}
+	throw lastError;
+}
+
+afterEach(async () => {
 	for (const route of routes.splice(0)) {
-		fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+		await removeDirWithRetry(path.dirname(route.eventSink));
 	}
 	for (const [key, value] of Object.entries(savedEnv)) {
 		if (value === undefined) delete process.env[key];
@@ -69,6 +85,42 @@ function child(id: string, state: "queued" | "running" | "complete" | "failed" |
 		steps: [{ agent: "leaf", status: state === "running" ? "running" as const : "complete" as const }],
 	};
 }
+
+describe("nested route index", () => {
+	it("indexes routes by root run id in a single directory scan", () => {
+		const routeA = trackRoute("index-root-a");
+		const routeB = trackRoute("index-root-b");
+
+		const index = buildNestedRouteIndex();
+
+		assert.equal(index.get("index-root-a")?.capabilityToken, routeA.capabilityToken);
+		assert.equal(index.get("index-root-b")?.capabilityToken, routeB.capabilityToken);
+		assert.equal(index.get("missing-root"), undefined);
+	});
+
+	it("keeps at most one route when a root run id has duplicate route dirs", () => {
+		const first = trackRoute("dup-root");
+		const second = trackRoute("dup-root");
+
+		const index = buildNestedRouteIndex();
+
+		// readdir order is not guaranteed, so the contract is deduplication: exactly
+		// one route is indexed per root run id, not a specific winner.
+		const indexed = index.get("dup-root");
+		assert.ok(indexed, "expected one route for dup-root");
+		const tokens = new Set([first.capabilityToken, second.capabilityToken]);
+		assert.ok(tokens.has(indexed.capabilityToken), "indexed route must be one of the two created routes");
+	});
+
+	it("recovers a route from its index when the route file is missing", () => {
+		const route = trackRoute("late-route-root");
+		const routeFile = path.join(path.dirname(route.eventSink), "route.json");
+		fs.rmSync(routeFile);
+
+		assert.equal(buildNestedRouteIndex().get("late-route-root")?.capabilityToken, route.capabilityToken);
+		assert.equal(JSON.parse(fs.readFileSync(routeFile, "utf-8")).capabilityToken, route.capabilityToken);
+	});
+});
 
 describe("nested event route validation", () => {
 	it("resolves nested parent addresses with full inherited path", () => {
@@ -121,21 +173,25 @@ describe("nested event parsing and projection", () => {
 			ts: 100,
 			parentRunId: "root-run",
 			parentStepIndex: 1,
-			child: child("nested-a", "running", 100),
+			child: { ...child("nested-a", "running", 100), model: "provider/gpt-5.6-luna:medium", thinking: "medium", steps: [{ agent: "leaf", status: "running", model: "provider/leaf", thinking: "low" }], children: [child("nested-grandchild", "running", 100, "nested-a")] },
 		});
 		writeNestedEvent(route, {
 			type: "subagent.nested.updated",
 			ts: 200,
 			parentRunId: "root-run",
 			parentStepIndex: 1,
-			child: { ...child("nested-a", "running", 200), currentTool: "read" },
+			child: {
+				...child("nested-a", "running", 200),
+				currentTool: "read",
+				runtimeAcknowledgedExtensions: { version: 1, source: "child-runtime", ids: ["ext.ok", "bad/path", "ext.ok"], omitted: 1 },
+			},
 		});
 		writeNestedEvent(route, {
 			type: "subagent.nested.completed",
 			ts: 300,
 			parentRunId: "root-run",
 			parentStepIndex: 1,
-			child: child("nested-a", "complete", 300),
+			child: { ...child("nested-a", "complete", 300), runtimeAcknowledgedExtensions: { version: 1, source: "child-runtime", ids: ["ext.ok", "bad/path", "ext.ok"], omitted: 1 } },
 		});
 
 		const registry = projectNestedEvents(route);
@@ -143,6 +199,17 @@ describe("nested event parsing and projection", () => {
 		assert.equal(registry.children[0]?.id, "nested-a");
 		assert.equal(registry.children[0]?.state, "complete");
 		assert.equal(registry.children[0]?.steps?.[0]?.agent, "leaf");
+		assert.equal(registry.children[0]?.model, "provider/gpt-5.6-luna:medium");
+		assert.equal(registry.children[0]?.thinking, "medium");
+		assert.equal(registry.children[0]?.steps?.[0]?.model, "provider/leaf");
+		assert.equal(registry.children[0]?.steps?.[0]?.thinking, "low");
+		assert.equal(registry.children[0]?.children?.[0]?.id, "nested-grandchild");
+		assert.deepEqual(registry.children[0]?.runtimeAcknowledgedExtensions, {
+			version: 1,
+			source: "child-runtime",
+			ids: ["ext.ok"],
+			omitted: 1,
+		});
 
 		const job: AsyncJobState = {
 			asyncId: "root-run",
@@ -297,5 +364,111 @@ describe("nested event parsing and projection", () => {
 		})}\n{"type":"subagent.nested.started"`, route);
 		assert.equal(records.length, 1);
 		assert.equal(records[0]?.child.id, "jsonl-good");
+	});
+
+
+	it("sanitizes nested model bounds and thinking levels", () => {
+		const route = trackRoute();
+		writeNestedEvent(route, {
+			type: "subagent.nested.updated",
+			ts: 100,
+			parentRunId: "root-run",
+			parentStepIndex: 1,
+			child: {
+				...child("nested-model-bounds", "running", 100),
+				model: "m".repeat(600),
+				thinking: "turbo",
+				steps: [{ agent: "leaf", status: "running", model: "worker", thinking: "xhigh" }],
+			},
+		});
+		const summary = projectNestedEvents(route).children[0]!;
+		assert.equal(summary.model?.length, 512);
+		assert.equal(summary.thinking, undefined);
+		assert.equal(summary.steps?.[0]?.thinking, "xhigh");
+	});
+
+	it("projects effective model and thinking from async status, including a single-step run", () => {
+		const summary = nestedSummaryFromAsyncStatus({
+			runId: "child-run",
+			mode: "single",
+			state: "running",
+			startedAt: 1,
+			steps: [
+				{ agent: "worker", status: "running", model: "provider/worker", thinking: "high" },
+			],
+		}, "/tmp/child-run", { id: "child-run", parentRunId: "parent-run", depth: 1, mode: "single", ts: 2 });
+
+		assert.equal(summary.model, "provider/worker");
+		assert.equal(summary.thinking, "high");
+		assert.equal(summary.steps?.[0]?.model, "provider/worker");
+		assert.equal(summary.steps?.[0]?.thinking, "high");
+	});
+
+	it("sanitizes malformed process-terminal proofs in nested status summaries", () => {
+		const summary = nestedSummaryFromAsyncStatus({
+			runId: "child-run",
+			mode: "single",
+			state: "complete",
+			startedAt: 1,
+			processTerminal: { version: 1, state: "bogus", runId: "child-run", runnerProcessInstanceId: "runner-1" } as never,
+			steps: [{
+				agent: "worker",
+				status: "complete",
+				processTerminal: { version: 1, state: "observed", runId: "wrong-run", runnerProcessInstanceId: "runner-1" } as never,
+			}],
+		}, "/tmp/child-run", { id: "child-run", parentRunId: "parent-run", depth: 1, mode: "single", ts: 2 });
+
+		assert.equal(summary.processTerminal?.state, "unknown");
+		assert.equal(summary.processTerminal?.reason, "proof-write-failed");
+		assert.equal(summary.steps?.[0]?.processTerminal?.state, "unknown");
+		assert.equal(summary.steps?.[0]?.processTerminal?.reason, "proof-write-failed");
+	});
+
+	it("sanitizes runtime acknowledged extensions in nested status summaries", () => {
+		const summary = nestedSummaryFromAsyncStatus({
+			runId: "child-run",
+			mode: "single",
+			state: "complete",
+			startedAt: 1,
+			runtimeAcknowledgedExtensions: { version: 1, source: "child-runtime", ids: ["/Users/alice/.secret-extension", "ok-ext", "x".repeat(5000)], omitted: 0 } as never,
+			steps: [{
+				agent: "worker",
+				status: "complete",
+				runtimeAcknowledgedExtensions: { version: 1, source: "child-runtime", ids: ["C:/Users/alice/secret"], omitted: 0 } as never,
+			}],
+		}, "/tmp/child-run", { id: "child-run", parentRunId: "parent-run", depth: 1, mode: "single", ts: 2 });
+
+		assert.deepEqual(summary.runtimeAcknowledgedExtensions?.ids, ["ok-ext"]);
+		assert.equal(summary.steps?.[0]?.runtimeAcknowledgedExtensions, undefined);
+	});
+
+	it("removes evicted status files without replaying completed children", () => {
+		const route = trackRoute();
+		for (let index = 0; index < 1000; index++) {
+			writeNestedEvent(route, {
+				type: "subagent.nested.updated",
+				ts: index + 1,
+				parentRunId: "root-run",
+				parentStepIndex: 1,
+				child: child("nested-retained", "running", index + 1),
+			});
+		}
+		writeNestedEvent(route, {
+			type: "subagent.nested.completed",
+			ts: 1001,
+			parentRunId: "root-run",
+			parentStepIndex: 1,
+			child: child("nested-retained", "complete", 1001),
+		});
+
+		assert.equal(fs.readdirSync(route.eventSink).length, 1001);
+		const firstProjection = projectNestedEvents(route);
+		assert.equal(firstProjection.processedEvents.length, 1000);
+		assert.equal(fs.readdirSync(route.eventSink).length, 1000);
+		assert.equal(firstProjection.children[0]?.state, "complete");
+
+		const secondProjection = projectNestedEvents(route);
+		assert.deepEqual(secondProjection, firstProjection);
+		assert.equal(secondProjection.children[0]?.state, "complete");
 	});
 });

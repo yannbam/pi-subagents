@@ -3,9 +3,35 @@ import path from "node:path";
 
 const queueDir = process.env.MOCK_PI_QUEUE_DIR;
 
+function exitAfterFlush(code) {
+	// process.exit() can truncate buffered stdout/stderr on slow runners (e.g.
+	// GitHub Actions), dropping the final lines the parent executor needs to see
+	// the run as successful. Drain the writable streams first, then exit.
+	// A hard timeout (ref'd, not unref'd) guards against stream.end() callbacks
+	// that never fire on some platforms (notably Windows pipe-backed stdout).
+	const streams = [process.stdout, process.stderr].filter((s) => !s.destroyed && !s.writableEnded);
+	if (streams.length === 0) {
+		process.exit(code);
+		return;
+	}
+	let exited = false;
+	const forceExit = () => {
+		if (exited) return;
+		exited = true;
+		process.exit(code);
+	};
+	let pending = streams.length;
+	for (const stream of streams) {
+		stream.end(() => {
+			if (--pending === 0) forceExit();
+		});
+	}
+	setTimeout(forceExit, 500);
+}
+
 function fail(message, exitCode = 1) {
 	process.stderr.write(`${message}\n`);
-	process.exit(exitCode);
+	exitAfterFlush(exitCode);
 }
 
 function listPendingFiles(dir) {
@@ -141,6 +167,58 @@ function defaultResponse() {
 	return { output: "ok", exitCode: 0 };
 }
 
+function writeDeclaredFiles(response) {
+	if (!Array.isArray(response.writeFiles)) return;
+	for (const file of response.writeFiles) {
+		if (!file || typeof file.path !== "string" || typeof file.content !== "string") continue;
+		const target = path.resolve(process.cwd(), file.path);
+		fs.mkdirSync(path.dirname(target), { recursive: true });
+		fs.writeFileSync(target, file.content, "utf-8");
+	}
+}
+
+function writeStructuredOutputCapture(response) {
+	if (!Object.prototype.hasOwnProperty.call(response, "structuredOutputCapture")) return;
+	const outputPath = process.env.PI_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE;
+	if (!outputPath) return;
+	fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+	fs.writeFileSync(outputPath, JSON.stringify(response.structuredOutputCapture), "utf-8");
+}
+
+function writeRuntimeAcknowledgedExtensions(response) {
+	if (!Object.prototype.hasOwnProperty.call(response, "runtimeAcknowledgedExtensions")) return;
+	const outputPath = process.env.PI_SUBAGENT_RUNTIME_ACKNOWLEDGED_EXTENSIONS;
+	if (!outputPath) return;
+	fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+	fs.writeFileSync(outputPath, JSON.stringify(response.runtimeAcknowledgedExtensions), "utf-8");
+}
+
+function writeToolDiagnostic(response) {
+	if (!Array.isArray(response.missingTools) || response.missingTools.length === 0) return;
+	const diagnosticPath = process.env.PI_SUBAGENT_TOOL_DIAGNOSTIC_PATH;
+	const required = JSON.parse(process.env.PI_SUBAGENT_REQUIRED_TOOLS ?? "[]");
+	if (!diagnosticPath || !Array.isArray(required)) return;
+	const missing = response.missingTools.filter((name) => typeof name === "string" && required.includes(name));
+	const available = required.filter((name) => !missing.includes(name));
+	fs.mkdirSync(path.dirname(diagnosticPath), { recursive: true });
+	fs.writeFileSync(diagnosticPath, JSON.stringify({
+		agent: process.env.PI_SUBAGENT_CHILD_AGENT,
+		required,
+		available,
+		missing,
+	}), "utf-8");
+}
+
+function readRequiredToolsEnv() {
+	try {
+		const encoded = process.env.PI_SUBAGENT_REQUIRED_TOOLS;
+		const parsed = encoded === undefined ? [] : JSON.parse(encoded);
+		return Array.isArray(parsed) ? parsed : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 function isJsonMode(args) {
 	for (let i = 0; i < args.length; i++) {
 		if (args[i] === "--mode") {
@@ -192,6 +270,15 @@ async function writeStdout(text) {
 async function writeJsonlLine(entry) {
 	const line = typeof entry === "string" ? entry : JSON.stringify(entry);
 	await writeStdout(`${line}\n`);
+}
+
+async function writeRawStdout(entry) {
+	if (Array.isArray(entry?.stdoutBase64Chunks)) {
+		for (const chunk of entry.stdoutBase64Chunks) {
+			if (typeof chunk === "string") await writeStdout(Buffer.from(chunk, "base64"));
+		}
+	}
+	if (typeof entry?.stdoutRaw === "string") await writeStdout(entry.stdoutRaw);
 }
 
 function extractPlainText(entry) {
@@ -253,31 +340,51 @@ async function main() {
 	const args = process.argv.slice(2);
 	const jsonMode = isJsonMode(args);
 	const response = claimNextResponse(queueDir, args) ?? defaultResponse();
+	if (response.ignoreSigterm === true) {
+		process.on("SIGTERM", () => {});
+	}
 	writeSessionFile(args);
-	fs.writeFileSync(
-		path.join(queueDir, `call-${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2)}.json`),
-		JSON.stringify({ args, systemPrompts: readSystemPromptRecords(args) }),
-		"utf-8",
-	);
+	writeToolDiagnostic(response);
+	const callPath = path.join(queueDir, `call-${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2)}.json`);
+	const callTempPath = `${callPath}.tmp-${process.pid}-${Date.now()}`;
+	fs.writeFileSync(callTempPath, JSON.stringify({ args, cwd: process.cwd(), systemPrompts: readSystemPromptRecords(args), requiredChildTools: readRequiredToolsEnv() }), "utf-8");
+	fs.renameSync(callTempPath, callPath);
 
 	if (typeof response.delay === "number" && response.delay > 0) {
 		await new Promise((resolve) => setTimeout(resolve, response.delay));
 	}
+	async function waitForReleasePath(waitForPath) {
+		if (typeof waitForPath !== "string") return;
+		const deadline = Date.now() + 30_000;
+		while (!fs.existsSync(waitForPath)) {
+			if (Date.now() >= deadline) fail(`Timed out waiting for mock release path: ${waitForPath}`);
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+	}
+	await waitForReleasePath(response.waitForPath);
+
+	writeDeclaredFiles(response);
+	writeStructuredOutputCapture(response);
+	writeRuntimeAcknowledgedExtensions(response);
 
 	if (Array.isArray(response.steps) && response.steps.length > 0) {
 		for (const step of response.steps) {
 			if (typeof step?.delay === "number" && step.delay > 0) {
 				await new Promise((resolve) => setTimeout(resolve, step.delay));
+			}
+			await waitForReleasePath(step?.waitForPath);
+			if (Array.isArray(step?.jsonl) && step.jsonl.length > 0) {
+					await writeResponseEntries(step.jsonl, jsonMode, args);
 				}
-				if (Array.isArray(step?.jsonl) && step.jsonl.length > 0) {
-						await writeResponseEntries(step.jsonl, jsonMode, args);
-				}
+				await writeRawStdout(step);
 				if (typeof step?.stderr === "string" && step.stderr.length > 0) {
 					process.stderr.write(step.stderr);
 				}
 			}
 		} else if (Array.isArray(response.jsonl) && response.jsonl.length > 0) {
-				await writeResponseEntries(response.jsonl, jsonMode, args);
+			await writeResponseEntries(response.jsonl, jsonMode, args);
+		} else if (Array.isArray(response.stdoutBase64Chunks) || typeof response.stdoutRaw === "string") {
+			await writeRawStdout(response);
 		} else if (Array.isArray(response.echoEnv) && response.echoEnv.length > 0) {
 			const envSnapshot = Object.fromEntries(response.echoEnv.map((key) => [key, process.env[key] ?? null]));
 				const output = withAcceptanceReport(JSON.stringify(envSnapshot), args);
@@ -298,7 +405,11 @@ async function main() {
 		await new Promise((resolve) => setTimeout(resolve, response.keepAliveAfterFinalMessageMs));
 	}
 
-	process.exit(typeof response.exitCode === "number" ? response.exitCode : 0);
+	if (typeof response.signal === "string") {
+		process.kill(process.pid, response.signal);
+		return;
+	}
+	exitAfterFlush(typeof response.exitCode === "number" ? response.exitCode : 0);
 }
 
 main().catch((error) => {

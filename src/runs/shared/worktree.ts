@@ -2,14 +2,18 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { resolveAuthorityDecision, type AuthorityPolicyConfig } from "../../policy/authority.ts";
+import { PROJECT_SUBAGENTS_RELATIVE_DIR } from "../../shared/artifacts.ts";
+import { getAgentDir } from "../../shared/utils.ts";
 
 export interface WorktreeSetup {
 	cwd: string;
 	worktrees: WorktreeInfo[];
 	baseCommit: string;
+	capturedDiffs?: WorktreeDiff[];
 }
 
-interface WorktreeInfo {
+export interface WorktreeInfo {
 	path: string;
 	agentCwd: string;
 	branch: string;
@@ -18,7 +22,7 @@ interface WorktreeInfo {
 	syntheticPaths: string[];
 }
 
-interface WorktreeDiff {
+export interface WorktreeDiff {
 	index: number;
 	agent: string;
 	branch: string;
@@ -27,6 +31,35 @@ interface WorktreeDiff {
 	insertions: number;
 	deletions: number;
 	patchPath: string;
+	error?: string;
+}
+
+export interface WorktreeCleanupTask {
+	index: number;
+	path: string;
+	branch: string;
+	worktreeRemoved: boolean;
+	branchRemoved: boolean;
+	preserved?: boolean;
+	reason?: string;
+	errors?: string[];
+}
+
+export type WorktreeCleanupIntent =
+	| { kind: "preserve"; capturedDiffs?: WorktreeDiff[]; handoffManifestPath?: string; cleanupBlocker?: string }
+	| {
+		kind: "discard";
+		authorization:
+			| { kind: "policy"; policy?: AuthorityPolicyConfig }
+			| { kind: "confirmed"; policy?: AuthorityPolicyConfig };
+	}
+	| { kind: "setup-rollback" };
+
+export interface WorktreeCleanupReport {
+	state: "complete" | "partial";
+	tasks: WorktreeCleanupTask[];
+	pruned: boolean;
+	errors?: string[];
 }
 
 interface WorktreeTaskCwdConflict {
@@ -43,6 +76,7 @@ interface WorktreeSetupHookConfig {
 interface CreateWorktreesOptions {
 	agents?: string[];
 	setupHook?: WorktreeSetupHookConfig;
+	baseDir?: string;
 }
 
 interface ResolvedWorktreeSetupHook {
@@ -81,7 +115,7 @@ interface RepoState {
 const DEFAULT_WORKTREE_SETUP_HOOK_TIMEOUT_MS = 30000;
 
 function runGit(cwd: string, args: string[]): GitResult {
-	const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf-8" });
+	const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf-8", windowsHide: true });
 	return {
 		stdout: result.stdout ?? "",
 		stderr: result.stderr ?? "",
@@ -103,7 +137,9 @@ function resolveRepoState(cwd: string): RepoState {
 	const cwdRelative = resolveRepoCwdRelative(cwd);
 	const toplevel = runGitChecked(cwd, ["rev-parse", "--show-toplevel"]).trim();
 
-	const status = runGitChecked(toplevel, ["status", "--porcelain"]);
+	// pi-subagents writes durable runtime state under .pi/subagents/ by default;
+	// that state must not make managed isolation unusable for later runs.
+	const status = runGitChecked(toplevel, ["status", "--porcelain", "--", `:!${PROJECT_SUBAGENTS_RELATIVE_DIR}`]);
 	if (status.trim().length > 0) {
 		throw new Error("worktree isolation requires a clean git working tree. Commit or stash changes first.");
 	}
@@ -114,11 +150,17 @@ function resolveRepoState(cwd: string): RepoState {
 
 function normalizeComparableCwd(cwd: string): string {
 	const resolved = path.resolve(cwd);
-	try {
-		return fs.realpathSync(resolved);
-	} catch {
-		// Use the unresolved absolute path when realpath resolution is unavailable.
-		return resolved;
+	let existing = resolved;
+	const missingSegments: string[] = [];
+	while (true) {
+		try {
+			return path.join(fs.realpathSync(existing), ...missingSegments.reverse());
+		} catch {
+			const parent = path.dirname(existing);
+			if (parent === existing) return resolved;
+			missingSegments.push(path.basename(existing));
+			existing = parent;
+		}
 	}
 }
 
@@ -152,8 +194,31 @@ function buildWorktreeBranch(runId: string, index: number): string {
 	return `pi-parallel-${runId}-${index}`;
 }
 
-function buildWorktreePath(runId: string, index: number): string {
-	return path.join(os.tmpdir(), `pi-worktree-${runId}-${index}`);
+function resolveWorktreeBaseDir(configuredBaseDir: string | undefined, repoRoot: string): string {
+	const rawBaseDir = configuredBaseDir ?? process.env.PI_SUBAGENTS_WORKTREE_DIR;
+	if (rawBaseDir === undefined) return os.tmpdir();
+
+	const trimmed = rawBaseDir.trim();
+	if (!trimmed) throw new Error("worktree base directory cannot be empty");
+
+	const expanded = trimmed.startsWith("~/") ? path.join(os.homedir(), trimmed.slice(2)) : trimmed;
+	const resolved = path.isAbsolute(expanded) ? expanded : path.resolve(repoRoot, expanded);
+	const extensionsDir = normalizeComparableCwd(path.join(getAgentDir(), "extensions"));
+	const relativeToExtensions = path.relative(extensionsDir, normalizeComparableCwd(resolved));
+	if (!relativeToExtensions || (!relativeToExtensions.startsWith(`..${path.sep}`) && relativeToExtensions !== ".." && !path.isAbsolute(relativeToExtensions))) {
+		throw new Error(`worktree base directory cannot be inside Pi extensions directory: ${extensionsDir}. Choose a directory outside it.`);
+	}
+	try {
+		fs.mkdirSync(resolved, { recursive: true });
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		throw new Error(`failed to create worktree base directory ${resolved}: ${message}`);
+	}
+	return resolved;
+}
+
+function buildWorktreePath(baseDir: string, runId: string, index: number): string {
+	return path.join(baseDir, `pi-worktree-${runId}-${index}`);
 }
 
 function resolveRepoCwdRelative(cwd: string): string {
@@ -168,9 +233,10 @@ function resolveRepoCwdRelative(cwd: string): string {
 	return normalizedPrefix === "." ? "" : normalizedPrefix;
 }
 
-export function resolveExpectedWorktreeAgentCwd(cwd: string, runId: string, index: number): string {
+export function resolveExpectedWorktreeAgentCwd(cwd: string, runId: string, index: number, baseDir?: string): string {
 	const cwdRelative = resolveRepoCwdRelative(cwd);
-	const worktreePath = buildWorktreePath(runId, index);
+	const repoRoot = runGitChecked(cwd, ["rev-parse", "--show-toplevel"]).trim();
+	const worktreePath = buildWorktreePath(resolveWorktreeBaseDir(baseDir, repoRoot), runId, index);
 	return cwdRelative ? path.join(worktreePath, cwdRelative) : worktreePath;
 }
 
@@ -272,6 +338,7 @@ function runWorktreeSetupHook(
 	input: WorktreeSetupHookInput,
 ): string[] {
 	const result = spawnSync(hook.hookPath, [], {
+		windowsHide: true,
 		cwd: input.worktreePath,
 		encoding: "utf-8",
 		input: JSON.stringify(input),
@@ -320,9 +387,10 @@ function createSingleWorktree(
 	baseCommit: string,
 	setupHook: ResolvedWorktreeSetupHook | undefined,
 	agent: string | undefined,
+	baseDir: string,
 ): WorktreeInfo {
 	const branch = buildWorktreeBranch(runId, index);
-	const worktreePath = buildWorktreePath(runId, index);
+	const worktreePath = buildWorktreePath(baseDir, runId, index);
 	const add = runGit(toplevel, ["worktree", "add", worktreePath, "-b", branch, "HEAD"]);
 	if (add.status !== 0) {
 		const message = add.stderr.trim() || add.stdout.trim() || `failed to create worktree ${worktreePath}`;
@@ -405,7 +473,7 @@ function removeSyntheticPathsBeforeDiff(worktree: WorktreeInfo): void {
 	}
 }
 
-function emptyDiff(index: number, agent: string, branch: string, patchPath: string): WorktreeDiff {
+function emptyDiff(index: number, agent: string, branch: string, patchPath: string, error?: string): WorktreeDiff {
 	return {
 		index,
 		agent,
@@ -415,6 +483,7 @@ function emptyDiff(index: number, agent: string, branch: string, patchPath: stri
 		insertions: 0,
 		deletions: 0,
 		patchPath,
+		...(error ? { error } : {}),
 	};
 }
 
@@ -476,13 +545,131 @@ function writeEmptyPatch(patchPath: string): void {
 	}
 }
 
-function cleanupSingleWorktree(repoCwd: string, worktree: WorktreeInfo): void {
-	try { runGitChecked(repoCwd, ["worktree", "remove", "--force", worktree.path]); } catch {
-		// Cleanup is best-effort to avoid masking caller errors.
+function handoffRecordsPatch(manifestPath: string | undefined, patchPath: string): boolean {
+	if (!manifestPath || !fs.existsSync(manifestPath)) return false;
+	try {
+		const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf-8")) as {
+			version?: unknown;
+			groups?: Array<{ children?: Array<{ patch?: { path?: unknown; error?: unknown } }> }>;
+		};
+		if (manifest.version !== 1 || !Array.isArray(manifest.groups)) return false;
+		const resolvedPatchPath = path.resolve(patchPath);
+		return manifest.groups.some((group) => Array.isArray(group.children) && group.children.some((child) =>
+			child.patch?.error === undefined
+			&& typeof child.patch?.path === "string"
+			&& path.resolve(child.patch.path) === resolvedPatchPath,
+		));
+	} catch {
+		return false;
 	}
-	try { runGitChecked(repoCwd, ["branch", "-D", worktree.branch]); } catch {
-		// Cleanup is best-effort to avoid masking caller errors.
+}
+
+function cleanupSingleWorktree(
+	setup: WorktreeSetup,
+	worktree: WorktreeInfo,
+	intent: WorktreeCleanupIntent,
+): WorktreeCleanupTask {
+	const errors: string[] = [];
+	let worktreeRemoved = false;
+	let branchRemoved = false;
+	if (intent.kind === "preserve" && intent.cleanupBlocker) {
+		return {
+			index: worktree.index,
+			path: worktree.path,
+			branch: worktree.branch,
+			worktreeRemoved: false,
+			branchRemoved: false,
+			preserved: true,
+			reason: intent.cleanupBlocker,
+		};
 	}
+	if (intent.kind !== "setup-rollback") {
+		try {
+			removeSyntheticPathsBeforeDiff(worktree);
+		} catch (error) {
+			errors.push(`synthetic path cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		const status = runGit(worktree.path, ["status", "--porcelain"]);
+		const baseDiff = runGit(worktree.path, ["diff", "--quiet", setup.baseCommit, "--"]);
+		if (status.status !== 0 || (baseDiff.status !== 0 && baseDiff.status !== 1)) {
+			const reason = status.status !== 0
+				? status.stderr.trim() || status.stdout.trim() || "git status failed"
+				: baseDiff.stderr.trim() || baseDiff.stdout.trim() || "git diff check failed";
+			return {
+				index: worktree.index,
+				path: worktree.path,
+				branch: worktree.branch,
+				worktreeRemoved: false,
+				branchRemoved: false,
+				preserved: true,
+				reason: "cleanup safety check failed",
+				errors: [...errors, `cleanup refused: ${reason}`],
+			};
+		}
+		const hasWork = status.stdout.trim().length > 0 || baseDiff.status === 1;
+		if (hasWork && intent.kind === "preserve") {
+			const captured = (intent.capturedDiffs ?? setup.capturedDiffs)?.find((diff) => diff.index === worktree.index);
+			const patchCaptured = captured !== undefined
+				&& captured.error === undefined
+				&& fs.existsSync(captured.patchPath)
+				&& fs.statSync(captured.patchPath).size > 0
+				&& handoffRecordsPatch(intent.handoffManifestPath, captured.patchPath);
+			if (!patchCaptured) {
+				const reason = "worktree contains changes that are not represented by a captured handoff patch";
+				return {
+					index: worktree.index,
+					path: worktree.path,
+					branch: worktree.branch,
+					worktreeRemoved: false,
+					branchRemoved: false,
+					preserved: true,
+					reason,
+					errors: [...errors, `cleanup refused: ${reason}; preserved ${worktree.path}`],
+				};
+			}
+		}
+		if (hasWork && intent.kind === "discard") {
+			const decision = resolveAuthorityDecision({ action: "discardWorktree", policy: intent.authorization.policy });
+			const authorized = decision === "auto" || (decision === "confirm" && intent.authorization.kind === "confirmed");
+			if (!authorized) {
+				const reason = decision === "forbid"
+					? "authority policy forbids worktree discard"
+					: "worktree discard requires explicit user confirmation";
+				return {
+					index: worktree.index,
+					path: worktree.path,
+					branch: worktree.branch,
+					worktreeRemoved: false,
+					branchRemoved: false,
+					preserved: true,
+					reason,
+					errors: [...errors, `cleanup refused: ${reason}; preserved ${worktree.path}`],
+				};
+			}
+		}
+	}
+	try {
+		runGitChecked(setup.cwd, ["worktree", "remove", "--force", worktree.path]);
+		worktreeRemoved = true;
+	} catch (error) {
+		errors.push(`worktree removal failed: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	if (worktreeRemoved) {
+		try {
+			runGitChecked(setup.cwd, ["branch", "-D", worktree.branch]);
+			branchRemoved = true;
+		} catch (error) {
+			errors.push(`branch removal failed: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+	return {
+		index: worktree.index,
+		path: worktree.path,
+		branch: worktree.branch,
+		worktreeRemoved,
+		branchRemoved,
+		...(errors.length ? { errors } : {}),
+	};
 }
 
 function hasWorktreeChanges(diff: WorktreeDiff): boolean {
@@ -492,6 +679,7 @@ function hasWorktreeChanges(diff: WorktreeDiff): boolean {
 export function createWorktrees(cwd: string, runId: string, count: number, options?: CreateWorktreesOptions): WorktreeSetup {
 	const repo = resolveRepoState(cwd);
 	const setupHook = resolveWorktreeSetupHook(repo.toplevel, options?.setupHook);
+	const baseDir = resolveWorktreeBaseDir(options?.baseDir, repo.toplevel);
 	const worktrees: WorktreeInfo[] = [];
 
 	try {
@@ -504,6 +692,7 @@ export function createWorktrees(cwd: string, runId: string, count: number, optio
 				repo.baseCommit,
 				setupHook,
 				options?.agents?.[index],
+				baseDir,
 			));
 		}
 	} catch (error) {
@@ -511,7 +700,7 @@ export function createWorktrees(cwd: string, runId: string, count: number, optio
 			cwd: repo.toplevel,
 			worktrees,
 			baseCommit: repo.baseCommit,
-		});
+		}, { kind: "setup-rollback" });
 		throw error;
 	}
 
@@ -537,23 +726,41 @@ export function diffWorktrees(setup: WorktreeSetup, agents: string[], diffsDir: 
 		const patchPath = path.join(diffsDir, `task-${index}-${safePatchAgentName(agent)}.patch`);
 		try {
 			diffs.push(captureWorktreeDiff(setup, worktree, agent, patchPath));
-		} catch {
-			// Preserve execution flow; failed diff capture maps to an empty per-task patch.
+		} catch (error) {
+			// Preserve execution flow while retaining the failed capture as handoff evidence.
 			writeEmptyPatch(patchPath);
-			diffs.push(emptyDiff(index, agent, worktree.branch, patchPath));
+			diffs.push(emptyDiff(index, agent, worktree.branch, patchPath, error instanceof Error ? error.message : String(error)));
 		}
 	}
 
+	setup.capturedDiffs = diffs;
 	return diffs;
 }
 
-export function cleanupWorktrees(setup: WorktreeSetup): void {
+export function cleanupWorktrees(
+	setup: WorktreeSetup,
+	intent: WorktreeCleanupIntent = { kind: "preserve", ...(setup.capturedDiffs ? { capturedDiffs: setup.capturedDiffs } : {}) },
+): WorktreeCleanupReport {
+	const tasks: WorktreeCleanupTask[] = [];
 	for (let index = setup.worktrees.length - 1; index >= 0; index--) {
-		cleanupSingleWorktree(setup.cwd, setup.worktrees[index]!);
+		tasks.push(cleanupSingleWorktree(setup, setup.worktrees[index]!, intent));
 	}
-	try { runGitChecked(setup.cwd, ["worktree", "prune"]); } catch {
-		// Pruning is best-effort cleanup.
+	tasks.sort((left, right) => left.index - right.index);
+	const errors: string[] = [];
+	let pruned = false;
+	try {
+		runGitChecked(setup.cwd, ["worktree", "prune"]);
+		pruned = true;
+	} catch (error) {
+		errors.push(`worktree prune failed: ${error instanceof Error ? error.message : String(error)}`);
 	}
+	const state = tasks.every((task) => task.worktreeRemoved && task.branchRemoved) && pruned ? "complete" : "partial";
+	return {
+		state,
+		tasks,
+		pruned,
+		...(errors.length ? { errors } : {}),
+	};
 }
 
 export function formatWorktreeDiffSummary(diffs: WorktreeDiff[]): string {
